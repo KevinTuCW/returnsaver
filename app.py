@@ -1,0 +1,337 @@
+"""Return Saver — 退货挽留 Agent（MVP）
+
+五阶段流程：S1 意图识别 → S2 用户/订单校验 → S3 确认订单 → S4 售后规则核验 → S5 场景执行
+核心主张：LLM 有建议权，没有执行权；降退货率不得以损伤体验为代价。
+"""
+from __future__ import annotations
+
+import os
+import time
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+import config as C
+import guardrails as G
+import llm
+import metrics
+import policy
+import store
+from models import (Action, AcceptRequest, Intent, ModelTier, NegotiateRequest,
+                    ReturnReason, Scenario, Stage)
+
+app = FastAPI(title="Return Saver", version="0.2.0")
+
+HOLDOUT_PCT = int(os.getenv("RS_HOLDOUT_PCT", "0"))   # 生产置 10：对照组做增量归因
+ESCAPE = "随时回「还是要退」，我立刻转标准退货，不会多问一句。"
+
+
+# ════════════════════════════════════════════ 工具
+def _ok(session: store.Session, payload: dict, allow_retention: bool = True) -> dict:
+    """统一出口：补上体验不变量要求的字段，并在返回前自检。"""
+    payload.setdefault("session_id", session.session_id)
+    payload.setdefault("stage", session.stage.value)
+    payload.setdefault("escape_hatch", ESCAPE)
+    payload.setdefault("cost_usd", round(session.llm_cost_usd, 6))
+    payload.setdefault("model_calls", session.model_calls)
+    try:
+        G.assert_experience_invariants(payload, allow_retention)
+    except G.GuardrailTripped as e:
+        metrics.record_guardrail(e.layer, e.code)
+        session.guardrail_trips.append({"layer": e.layer, "code": e.code, "detail": e.detail})
+        print(f"EXPERIENCE_VIOLATION code={e.code} session={session.session_id} detail={e.detail}")
+        payload["experience_warning"] = {"code": e.code, "detail": e.detail}
+    return payload
+
+
+def _blocked(session: store.Session, trip: G.GuardrailTripped) -> JSONResponse:
+    metrics.record_guardrail(trip.layer, trip.code)
+    session.guardrail_trips.append({"layer": trip.layer, "code": trip.code, "detail": trip.detail})
+    print(f"GUARDRAIL_TRIGGERED layer={trip.layer} code={trip.code} "
+          f"session={session.session_id} detail={trip.detail}")
+    return JSONResponse(status_code=422, content={
+        "session_id": session.session_id,
+        "status": "guardrail_blocked",
+        "guardrail": {"layer": trip.layer, "code": trip.code, "detail": trip.detail},
+        "reply": "抱歉，这条我没法处理，已经为你转到标准退货流程，不会耽误你。",
+        "offer": None,
+        "next_action": "fallback_to_standard_return",
+        "escape_hatch": ESCAPE,
+    })
+
+
+def _track(session: store.Session, meta: dict) -> None:
+    session.llm_cost_usd += meta.get("cost_usd", 0.0)
+    session.model_calls.append(meta)
+
+
+def _release(session: store.Session, reply: str, reason: str) -> dict:
+    session.stage = Stage.CLOSED
+    session.outcome = "released"
+    metrics.record_conversation(session.scenario or "n/a", Action.STANDARD_RETURN.value,
+                                session.llm_cost_usd,
+                                [m["tier"] for m in session.model_calls])
+    return _ok(session, {"status": "released", "reply": reply, "offer": None,
+                         "release_reason": reason, "next_action": "standard_return"})
+
+
+# ════════════════════════════════════════════ 主入口
+@app.post("/api/negotiate")
+def negotiate(req: NegotiateRequest):
+    session = store.get_session(req.session_id) or store.new_session(req.customer_id)
+    if req.customer_id:
+        session.customer_id = req.customer_id
+    session.turns += 1
+
+    # 体验出口最优先：任何时候用户说要退，立刻放行
+    if req.want_return_anyway:
+        return _release(session, "没问题，已经为你开启退货流程，物流单马上发到邮箱。",
+                        "user_opted_out")
+    # round 只统计"真正发出过的挽留轮次"——确认订单、澄清身份都不占额度
+    if session.round >= C.MAX_NEGOTIATION_ROUNDS:
+        return _release(session, "不耽误你了，退货流程已经开好。", "max_rounds_reached")
+    if session.turns > C.MAX_SESSION_TURNS:
+        return _release(session, "这单我直接给你走退货，不再占用你时间。", "max_turns_reached")
+
+    # ── S1 意图识别（规则快路 → 小模型，永不用大模型）
+    intent_res, meta = llm.classify_intent(req.message)
+    _track(session, meta)
+    session.intent, session.reason = intent_res.intent.value, intent_res.reason.value
+    session.emotion = max(session.emotion, intent_res.emotion)   # 情绪只升不降
+    session.stage = Stage.VERIFY
+
+    if intent_res.intent is Intent.OTHER:
+        session.stage = Stage.CLOSED
+        return _ok(session, {"status": "passthrough", "intent": session.intent,
+                             "reply": "这个问题我转给人工客服同事，马上有人接。",
+                             "offer": None, "next_action": "handoff_to_main_agent"})
+
+    # ── S2 用户 / 订单校验
+    customer = store.CUSTOMERS.get(session.customer_id or "")
+    orders = store.orders_of(session.customer_id) if session.customer_id else []
+    ok, why = policy.verify_customer_and_orders(customer, orders)
+    if not ok:
+        session.stage = Stage.CLOSED
+        return _ok(session, {"status": "verification_failed", "code": why,
+                             "reply": "我这边没查到对应的订单，方便提供一下订单号或下单邮箱吗？",
+                             "offer": None, "next_action": "ask_for_identity"})
+
+    # ── S3 和用户确认订单（必须显式确认，防止认错单动错钱）
+    candidates = policy.pick_candidate_orders(orders)
+    if not candidates:
+        session.stage = Stage.CLOSED
+        return _ok(session, {"status": "no_returnable_order",
+                             "reply": "你名下近期没有可退的已签收订单，要我帮你查别的吗？",
+                             "offer": None, "next_action": "handoff_to_main_agent"})
+
+    order_id = req.confirm_order_id or session.order_id
+    if not order_id:
+        session.stage = Stage.CONFIRM
+        session.candidate_orders = [o["order_id"] for o in candidates]
+        return _ok(session, {
+            "status": "awaiting_order_confirmation",
+            "reply": "为了不弄错，先跟你确认一下是这单吗？",
+            "candidates": [{"order_id": o["order_id"], "product": o["product"],
+                            "total": o["total"],
+                            "delivered_days_ago": o["days_since_delivery"]}
+                           for o in candidates[:3]],
+            "offer": None,
+            "next_action": "reply_with_confirm_order_id",
+        })
+
+    order = store.ORDERS.get(order_id)
+    if not order or order["customer_id"] != session.customer_id:
+        return _ok(session, {"status": "order_mismatch",
+                             "reply": "这个订单号和你的账号对不上，麻烦再核对一下。",
+                             "offer": None, "next_action": "ask_for_identity"})
+    session.order_id = order_id
+
+    # 对照组：不做任何挽留，用于增量归因
+    if HOLDOUT_PCT and (hash(session.session_id) % 100) < HOLDOUT_PCT:
+        session.scenario = "holdout"
+        metrics.record_conversation("holdout", Action.STANDARD_RETURN.value,
+                                    session.llm_cost_usd,
+                                    [m["tier"] for m in session.model_calls], holdout=True)
+        session.stage = Stage.CLOSED
+        return _ok(session, {"status": "holdout_control", "reply": "好的，已为你开启退货流程。",
+                             "offer": None, "next_action": "standard_return"})
+
+    # ── S4 售后规则核验
+    session.stage = Stage.ELIGIBILITY
+    reason = ReturnReason(session.reason)
+    elig = policy.check_eligibility(order, reason)
+
+    # ── S5 场景分类 + 执行策略
+    session.stage = Stage.EXECUTE
+    scenario = policy.classify_scenario(order, reason, session.emotion, elig)
+    session.scenario = scenario.value
+
+    # 情绪激烈场景：不生成任何挽留话术，直接分级执行（不消耗谈判额度）
+    if scenario is Scenario.EMOTIONAL_INSIST:
+        res = policy.build_resolution(order, customer, scenario, elig, session.round)
+        return _emotional(session, order, res["action"], res["payload"])
+
+    session.round += 1     # 到这里才是真正的一轮挽留；让利阶梯按这个数加码
+    res = policy.build_resolution(order, customer, scenario, elig, session.round)
+    action, offers, allow_retention = res["action"], res["offers"], res["allow_retention"]
+
+    # 生成侧动态路由
+    tier, route_reason = llm.route_generation(
+        scenario, session.emotion, order["total"], session.round,
+        customer.get("tier", "normal"), session.llm_cost_usd)
+
+    ctx = {"customer_name": customer["name"], "product": order["product"],
+           "scenario": scenario.value, "reason": session.reason,
+           "days_since_delivery": order["days_since_delivery"],
+           "user_message": req.message}
+    raw, gmeta = llm.generate_copy(tier, ctx, offers, req.force)
+    gmeta["route_reason"] = route_reason
+    _track(session, gmeta)
+
+    allowed_ids = {o["offer_id"] for o in offers}
+    approved = {f"${o['value']:.2f}" for o in offers} | {"$0.00"}
+
+    # 模板档：不过 LLM，直接渲染确定性文案
+    if tier is ModelTier.NONE and not req.force:
+        return _template_reply(session, order, scenario, action, offers, res["payload"])
+
+    # ── L2 / L3 护栏
+    try:
+        proposal = G.validate_proposal(raw, allowed_ids, order)
+        offer = next(o for o in offers if o["offer_id"] == proposal.offer_id)
+        G.validate_value_cap(offer, order)
+        G.scan_output_text(proposal.message, approved)
+    except G.GuardrailTripped as e:
+        return _blocked(session, e)
+
+    metrics.record_conversation(scenario.value, action.value, session.llm_cost_usd,
+                                [m["tier"] for m in session.model_calls])
+    payload = {
+        "status": "offer_made", "scenario": scenario.value, "action": action.value,
+        "reply": proposal.message,
+        "offer": {**offer},
+        "offer_token": G.issue_offer_token(order_id, offer),
+        "alternatives": [{"offer_id": o["offer_id"], "label": o["label"]}
+                         for o in offers if o["offer_id"] != offer["offer_id"]],
+        "next_action": "await_customer_decision",
+    }
+    if scenario is Scenario.USAGE_ISSUE and res["payload"].get("kb"):
+        payload["knowledge"] = res["payload"]["kb"]
+    return _ok(session, payload, allow_retention)
+
+
+# ════════════════════════════════════════════ 确定性模板分支（零 LLM 成本）
+def _template_reply(session: store.Session, order: dict, scenario: Scenario,
+                    action: Action, offers: list[dict], pl: dict) -> dict:
+    metrics.record_conversation(scenario.value, action.value, session.llm_cost_usd,
+                               [m["tier"] for m in session.model_calls])
+    if scenario is Scenario.NOT_ELIGIBLE:
+        cited = [{"code": c, "text": t} for c, t in pl["violated"]]
+        alt = offers[0] if offers else None
+        reply = ("我核对了一下，这单确实不符合退货条件，原因写在下面，你可以自己核对。"
+                 "但不能就这么算了——下面这个方案你看行不行。")
+        p = {"status": "declined", "scenario": scenario.value, "action": action.value,
+             "reply": reply, "cited_rules": cited, "policy_note": pl["policy_note"],
+             "offer": alt, "next_action": "await_customer_decision"}
+        if alt:
+            p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+        return _ok(session, p)
+
+    alt = offers[0] if offers else None
+    p = {"status": "offer_made", "scenario": scenario.value, "action": action.value,
+         "reply": "我先给你一个方案，你看合不合适。", "offer": alt,
+         "next_action": "await_customer_decision"}
+    if alt:
+        p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+    return _ok(session, p)
+
+
+# ════════════════════════════════════════════ 情绪激烈：分级处理
+def _emotional(session: store.Session, order: dict, action: Action, pl: dict) -> dict:
+    session.stage = Stage.CLOSED
+    metrics.record_conversation(Scenario.EMOTIONAL_INSIST.value, action.value,
+                                session.llm_cost_usd,
+                                [m["tier"] for m in session.model_calls])
+    if action is Action.INSTANT_REFUND:
+        session.outcome = "instant_refund"
+        keep = pl.get("keep_item")
+        reply = ("不跟你绕了，退款我已经直接发起，" + pl["eta"] + "。"
+                 + ("商品你留着就行，不用寄回。" if keep else "退货单已发你邮箱，上门取件免费。")
+                 + "这次是我们没做好，下次回来我给你留个补偿。")
+        return _ok(session, {
+            "status": "instant_refund", "scenario": Scenario.EMOTIONAL_INSIST.value,
+            "action": action.value, "reply": reply,
+            "refund": {"amount": pl["refund_amount"], "eta": pl["eta"],
+                       "keep_item": keep},
+            "experience_hook": {"type": "comeback_credit", "value": 10.0,
+                                "note": "退款完成后自动发放，90 天有效——把差体验变成下次再来的理由"},
+            "offer": None, "next_action": "refund_issued"}, allow_retention=False)
+
+    # 大额 / 异常 → 人工介入，但必须给死时效
+    session.outcome = "escalated"
+    ticket = {"ticket_id": f"T-{int(time.time())}", "order_id": order["order_id"],
+              "priority": pl["priority"], "sla_hours": pl["sla_hours"],
+              "anomalies": pl["anomalies"], "amount": order["total"],
+              "created_at": int(time.time())}
+    store.MANUAL_QUEUE.append(ticket)
+    reply = (f"这单金额比较大，我不想让机器替你做决定。已经转给专人，"
+             f"{pl['sla_hours']} 小时内一定给你答复，工单号 {ticket['ticket_id']}。"
+             f"在那之前退货权益不受影响，窗口我已经帮你冻结。")
+    return _ok(session, {
+        "status": "escalated", "scenario": Scenario.EMOTIONAL_INSIST.value,
+        "action": action.value, "reply": reply, "ticket": ticket,
+        "guarantee": {"return_window_frozen": True,
+                      "sla_hours": pl["sla_hours"]},
+        "offer": None, "next_action": "human_takeover"}, allow_retention=False)
+
+
+# ════════════════════════════════════════════ L4 执行层
+@app.post("/api/accept")
+def accept(req: AcceptRequest):
+    if req.idempotency_key in store.EXECUTED:
+        return {"status": "already_executed", **store.EXECUTED[req.idempotency_key]}
+    try:
+        payload = G.verify_offer_token(req.offer_token)
+    except G.GuardrailTripped as e:
+        metrics.record_guardrail(e.layer, e.code)
+        print(f"GUARDRAIL_TRIGGERED layer={e.layer} code={e.code} detail={e.detail}")
+        return JSONResponse(status_code=422, content={
+            "status": "guardrail_blocked",
+            "guardrail": {"layer": e.layer, "code": e.code, "detail": e.detail},
+            "reply": "这个方案已经失效了，我重新给你出一个。",
+            "next_action": "reissue_offer"})
+    result = {"order_id": payload["order_id"], "offer_id": payload["offer_id"],
+              "value": payload["value"], "executed_at": int(time.time())}
+    store.EXECUTED[req.idempotency_key] = result
+    return {"status": "executed", **result}
+
+
+# ════════════════════════════════════════════ 运维 / 看板
+@app.get("/health")
+def health():
+    return {"ok": True, "env": C.ENV,
+            "llm": "real" if C.USE_REAL_LLM else "mock",
+            "models": {"intent": C.MODEL_INTENT, "small": C.MODEL_SMALL,
+                       "large": C.MODEL_LARGE},
+            "holdout_pct": HOLDOUT_PCT}
+
+
+@app.get("/api/metrics")
+def get_metrics():
+    return metrics.snapshot()
+
+
+@app.get("/api/policy")
+def get_policy():
+    return store.MERCHANT_POLICY
+
+
+@app.get("/api/manual-queue")
+def manual_queue():
+    return {"pending": len(store.MANUAL_QUEUE), "tickets": store.MANUAL_QUEUE}
+
+
+@app.post("/api/csat")
+def csat(score: int, session_id: str | None = None):
+    metrics.record_csat(score)
+    return {"ok": True, "recorded": score}
