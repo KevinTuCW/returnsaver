@@ -15,9 +15,12 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env               # 填 key；不填也能跑
 .venv/bin/python -m uvicorn app:app --port 8777
-bash demo.sh                       # 12 段全流程演示
-.venv/bin/python -m pytest tests -q # 26 个 e2e 测试
+bash demo.sh                        # 12 段全流程演示
+.venv/bin/python -m pytest tests -q # 26 个 e2e 测试（强制 mock，不走网络）
+.venv/bin/python scripts/verify_live.py  # 真实 LLM + Langfuse 链路验证
 ```
+
+测试与真实链路验证**刻意分开**：`tests/conftest.py` 清空凭证强制走 mock，保证测试 1 秒跑完、不花钱、不因模型抖动假失败；真实链路由 `verify_live.py` 单独验。
 
 **零配置即可完整演示**：没 key 时 LLM 自动降级到确定性 mock、Langfuse 变 no-op、存储走内存，断网/限流都不翻车。
 
@@ -32,15 +35,23 @@ bash demo.sh                       # 12 段全流程演示
 ### LLM（OpenAI 兼容端点，默认智谱 GLM）
 
 ```bash
-RS_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-RS_LLM_API_KEY=<your key>          # 或 GLM_API_KEY
-RS_MODEL_INTENT=glm-4-flash        # 意图+情绪，最便宜那档
-RS_MODEL_SMALL=glm-4-air           # 常规话术
-RS_MODEL_LARGE=glm-4-plus          # 高情绪/高客单/二轮僵持
+RS_LLM_BASE_URL=https://api.z.ai/api/paas/v4/
+RS_LLM_API_KEY=<your key>
+RS_MODEL_INTENT=glm-4.5-air        # 意图+情绪
+RS_MODEL_SMALL=glm-5-turbo         # 常规话术
+RS_MODEL_LARGE=glm-4.6             # 高情绪/高客单/二轮僵持
+RS_THINKING_INTENT=false           # 三档一律关思考链，见下
+RS_THINKING_SMALL=false
+RS_THINKING_LARGE=false
 RS_COST_BUDGET=0.05                # 单会话成本硬预算，超了强制降模板
+RS_LATENCY_BUDGET=12               # 超时打告警
 ```
 
-换厂商只改这几行，代码一行不动。
+换厂商只改这几行，代码一行不动。模型名与能力是**实测**选定的，详见 [`docs/MODEL-SELECTION.md`](docs/MODEL-SELECTION.md)——三个反直觉的坑：
+
+- 旧文档里的 `glm-4-flash` / `glm-4-air` 在 z.ai 端点**不存在**
+- **「flash」档比「air」档贵**：`glm-5.3-flash*` 强制思考关不掉（错误码 1210），分类任务烧 126–152 token，`glm-4.5-air` 关思考链只要 41
+- **思考链对挽留话术是纯负收益**：延迟翻倍（19–22s → 9–10s）、token 涨 3 倍，话术几乎一样
 
 ### Langfuse 可观测性
 
@@ -130,14 +141,17 @@ psql "$DATABASE_URL" -f db/schema.sql
 | `small` | 默认 | 低 |
 | `large` | 情绪 ≥0.45 / 订单 ≥$200 / 第二轮僵持 / VIP 且 ≥$80 | 高但值得 |
 
-**实测**（`/api/metrics`，8 次会话）：
+**真实 LLM 实测**（`scripts/verify_live.py`，6 个场景走完整流程）：
 
 ```
-avg_cost_per_conversation_usd : 0.001383
-vs_case_budget ($0.15)        : 0.9%
-routing                       : none 16 / large 3 / small 1
+avg_cost_per_conversation_usd : 0.001141
+vs_case_budget ($0.15)        : 0.8%
+routing                       : none 13 / large 2 / small 1
+延迟                          : 模板 0s / glm-5-turbo 8.9s / glm-4.6 13.5s
 experience_violations         : 0
 ```
+
+13 次零调用（规则快路 + 确定性模板）才是成本压到预算 1% 以内的主因，不是选了便宜模型。
 
 单会话另有 `CONVERSATION_COST_BUDGET_USD` 硬预算，超了强制降档到模板。
 
@@ -207,9 +221,9 @@ demo.sh         12 段演示脚本
 
 ## 已知边界（MVP 范围外）
 
-- `MODEL_PRICING` 是量级占位值，上线前必须按厂商合同价替换
-- **真 LLM 路径尚未用真实 key 验证过**，当前所有成本数字来自确定性 mock 路径
-- **Langfuse 埋点尚未用真实 key 验证过**（代码按 v4 官方文档写，本地只验了 no-op 降级）
-- Postgres 已本地实测落库；但 `load_session` 尚未接回读路径，重启后仍从内存重建
+- **`glm-4.6` 13.5s 延迟仍超出 12s 预算**，已打告警。下一步必须上流式输出，把首字延迟压到 1–2s
+- `MODEL_PRICING` 是量级占位值；成本的**相对结构**是实测的，绝对值不是
+- Postgres 已实测落库；但 `load_session` 尚未接回读路径，重启后仍从内存重建
+- Langfuse 分数要查 `/api/public/v2/scores`（v1 端点返回空），且摄入有 ~15s 最终一致延迟
 - 情绪识别靠词典 + 小模型，未做多语言（跨境场景需补西/法/德语词典）
 - 人工工单队列是内存 list，未接 Zendesk/Gorgias

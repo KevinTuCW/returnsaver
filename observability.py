@@ -19,9 +19,20 @@ _enabled = False
 
 if C.USE_LANGFUSE:
     try:
-        from langfuse import get_client
+        from langfuse import Langfuse
 
-        _client = get_client(public_key=C.LANGFUSE_PUBLIC_KEY)
+        # 必须显式构造一次，把凭证注册进 SDK 的客户端表。只调 get_client() 拿不到，
+        # langfuse.openai 的 drop-in 会报 "No Langfuse client ... has been initialized"
+        # 并静默跳过整条 trace。
+        _client = Langfuse(
+            public_key=C.LANGFUSE_PUBLIC_KEY,
+            secret_key=C.LANGFUSE_SECRET_KEY,
+            base_url=C.LANGFUSE_BASE_URL,
+            environment=C.LANGFUSE_ENVIRONMENT,
+            sample_rate=C.LANGFUSE_SAMPLE_RATE,
+        )
+        if not _client.auth_check():
+            raise RuntimeError("auth_check 失败：public/secret key 或 base_url 不对")
         _enabled = True
     except Exception as e:      # SDK 缺失 / 鉴权失败 / 网络不通
         print(f"LANGFUSE_DISABLED reason={type(e).__name__}: {e}")

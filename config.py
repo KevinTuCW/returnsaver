@@ -36,15 +36,39 @@ LLM_API_KEY = os.getenv("RS_LLM_API_KEY") or os.getenv("GLM_API_KEY") or ""
 USE_REAL_LLM = bool(LLM_API_KEY.strip())
 
 # 三档模型：意图识别只用小模型，生成侧动态路由
-MODEL_INTENT = os.getenv("RS_MODEL_INTENT", "glm-4-flash")   # 分类/情绪
-MODEL_SMALL = os.getenv("RS_MODEL_SMALL", "glm-4-air")       # 常规挽留话术
-MODEL_LARGE = os.getenv("RS_MODEL_LARGE", "glm-4-plus")      # 高情绪/高客单/僵持
+# 模型名按 z.ai 端点实测可用集选定（见 docs/MODEL-SELECTION.md）
+MODEL_INTENT = os.getenv("RS_MODEL_INTENT", "glm-4.5-air")   # 分类/情绪，关思考链
+MODEL_SMALL = os.getenv("RS_MODEL_SMALL", "glm-5-turbo")     # 常规挽留话术
+MODEL_LARGE = os.getenv("RS_MODEL_LARGE", "glm-4.6")         # 高情绪/高客单/僵持
+
+# 思考链开关。GLM 新模型默认带 reasoning，对本产品的任务全是负收益：
+#   意图分类   开思考 5.8x token，答案一样
+#   生成话术   开思考 延迟翻倍(19-22s vs 9-10s)、输出 token 3x，而话术质量几乎无差别
+# 挽留话术只有 2-3 句，共情 + 给方案，不是需要推理的任务。三档一律关。
+# 注意 glm-5.3-flash* 强制思考、关不掉（错误码 1210），所以没选它们。
+def _b(key: str, default: bool) -> bool:
+    return os.getenv(key, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+MODEL_THINKING: dict[str, bool] = {
+    MODEL_INTENT: _b("RS_THINKING_INTENT", False),
+    MODEL_SMALL: _b("RS_THINKING_SMALL", False),
+    MODEL_LARGE: _b("RS_THINKING_LARGE", False),
+}
+# 聊天窗口里的延迟预算。超过这个数用户会直接关窗，比话术差一点严重得多。
+LATENCY_BUDGET_SECONDS = _f("RS_LATENCY_BUDGET", 12.0)
+# 推理模型会把 max_tokens 全烧在 reasoning 上导致 content 为空，必须留足预算
+MODEL_MAX_TOKENS: dict[str, int] = {
+    MODEL_INTENT: _i("RS_MAX_TOKENS_INTENT", 256),
+    MODEL_SMALL: _i("RS_MAX_TOKENS_SMALL", 512),
+    MODEL_LARGE: _i("RS_MAX_TOKENS_LARGE", 1024),
+}
 
 # 价格表 USD / 1K tokens。**量级占位值**，上线前必须按厂商合同价替换。
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    MODEL_INTENT: {"in": 0.00007, "out": 0.00007},
-    MODEL_SMALL:  {"in": 0.00070, "out": 0.00070},
-    MODEL_LARGE:  {"in": 0.00700, "out": 0.00700},
+    MODEL_INTENT: {"in": 0.00020, "out": 0.00020},
+    MODEL_SMALL:  {"in": 0.00060, "out": 0.00060},
+    MODEL_LARGE:  {"in": 0.00600, "out": 0.00600},
 }
 CONVERSATION_COST_BUDGET_USD = _f("RS_COST_BUDGET", 0.05)
 

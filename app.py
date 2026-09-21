@@ -97,10 +97,13 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
 # ════════════════════════════════════════════ 主入口
 @app.post("/api/negotiate")
 def negotiate(req: NegotiateRequest):
-    """一次调用 = 一个 Langfuse span，session_id 把整段对话串起来。"""
-    with obs.session_trace(req.session_id or "new", req.customer_id, req.message) as span:
-        out = _negotiate(req)
-        body = out.body if isinstance(out, JSONResponse) else out
+    """一次调用 = 一个 Langfuse span，session_id 把整段对话串起来。
+
+    会话必须在打开 trace **之前**解析出来——否则首轮的 trace 会挂到 "new" 上，
+    Langfuse 里就聚合不成一段完整对话。"""
+    session = store.get_session(req.session_id) or store.new_session(req.customer_id)
+    with obs.session_trace(session.session_id, req.customer_id, req.message) as span:
+        out = _negotiate(req, session)
         if span is not None and not isinstance(out, JSONResponse):
             obs.update(span, output={"status": out.get("status"),
                                      "scenario": out.get("scenario"),
@@ -110,8 +113,7 @@ def negotiate(req: NegotiateRequest):
         return out
 
 
-def _negotiate(req: NegotiateRequest):
-    session = store.get_session(req.session_id) or store.new_session(req.customer_id)
+def _negotiate(req: NegotiateRequest, session: store.Session):
     if req.customer_id:
         session.customer_id = req.customer_id
     session.turns += 1

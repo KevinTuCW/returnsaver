@@ -90,13 +90,30 @@ def rule_intent(text: str) -> IntentResult | None:
     return None      # 交给小模型
 
 
+# ════════════════════════════════════════════ 模型调用参数
+def _call_kwargs(model: str) -> dict:
+    """按模型给出 max_tokens 与思考链开关。
+    踩过的坑：GLM 新模型默认带 reasoning，会把 max_tokens 全烧在 reasoning_content 上，
+    content 返回空串且 finish_reason=length。分类任务必须关思考链 + 留足预算。"""
+    kw: dict = {"max_tokens": C.MODEL_MAX_TOKENS.get(model, 512)}
+    if C.MODEL_THINKING.get(model) is False:
+        kw["extra_body"] = {"thinking": {"type": "disabled"}}
+    return kw
+
+
+def _retry_without_thinking(e: Exception) -> bool:
+    """部分模型（glm-5.3-flash*）强制思考，关不掉会报 1210。识别出来就去掉该参数重试。"""
+    return "1210" in str(e) or "always engages in thinking" in str(e)
+
+
 # ════════════════════════════════════════════ 第二级：小模型意图识别
-INTENT_SYS = """你是电商售后意图分类器。只输出 JSON，不要解释。
-字段：
-  intent: return_request | complaint | question | other
-  reason: size_fit | damaged | quality | value_gap | usage | changed_mind | unknown
-  emotion: 0~1 的浮点数，用户愤怒/急迫程度
+INTENT_SYS = """你是电商售后意图分类器。只输出一个 JSON 对象，不要解释、不要 markdown。
+字段与**允许取值**（必须原样使用下列英文枚举值之一，不得自创、不得用中文描述）：
+  intent: "return_request" | "complaint" | "question" | "other"
+  reason: "size_fit" | "damaged" | "quality" | "value_gap" | "usage" | "changed_mind" | "unknown"
+  emotion: 0~1 的浮点数，表示用户的愤怒/急迫程度
   confidence: 0~1 的浮点数
+示例输出：{"intent":"return_request","reason":"size_fit","emotion":0.3,"confidence":0.9}
 """
 
 
@@ -113,15 +130,23 @@ def classify_intent(text: str) -> tuple[IntentResult, dict]:
         return res, {"tier": ModelTier.SMALL.value, "model": f"{C.MODEL_INTENT}(mock)",
                      "cost_usd": price(C.MODEL_INTENT, 180, 40), "tokens_in": 180, "tokens_out": 40}
 
+    msgs = [{"role": "system", "content": INTENT_SYS},
+            {"role": "user", "content": text[:800]}]
+    base = dict(model=C.MODEL_INTENT, messages=msgs, temperature=0.0,
+                response_format={"type": "json_object"})
     try:
-        r = _client().chat.completions.create(
-            model=C.MODEL_INTENT,
-            messages=[{"role": "system", "content": INTENT_SYS},
-                      {"role": "user", "content": text[:800]}],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        raw = json.loads(r.choices[0].message.content)
+        try:
+            r = _client().chat.completions.create(**base, **_call_kwargs(C.MODEL_INTENT))
+        except Exception as e:
+            if not _retry_without_thinking(e):
+                raise
+            kw = _call_kwargs(C.MODEL_INTENT)
+            kw.pop("extra_body", None)
+            r = _client().chat.completions.create(**base, **kw)
+        content = (r.choices[0].message.content or "").strip()
+        if not content:
+            raise LLMUnavailable(f"empty content (finish={r.choices[0].finish_reason})")
+        raw = json.loads(content)
         res = IntentResult.model_validate(raw)
     except Exception as e:      # 模型抖动不能阻断退货流程
         res = fast or IntentResult(intent=Intent.RETURN, reason=ReturnReason.UNKNOWN,
@@ -209,25 +234,42 @@ def generate_copy(tier: ModelTier, ctx: dict, offers: list[dict],
     if not C.USE_REAL_LLM:
         return mock_copy(ctx, offers), _meta(tier, f"{model}(mock)", 420, 90)
 
+    base = dict(
+        model=model,
+        messages=[{"role": "system", "content": GEN_SYS},
+                  {"role": "user", "content": json.dumps(
+                      {**ctx, "allowed_offers": [{"offer_id": o["offer_id"],
+                                                  "label": o["label"]} for o in offers]},
+                      ensure_ascii=False)}],
+        tools=[TOOL],
+        tool_choice={"type": "function", "function": {"name": "propose_copy"}},
+        temperature=0.4,
+    )
+    import time as _t
+    _t0 = _t.time()
     try:
-        r = _client().chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": GEN_SYS},
-                      {"role": "user", "content": json.dumps(
-                          {**ctx, "allowed_offers": [{"offer_id": o["offer_id"],
-                                                      "label": o["label"]} for o in offers]},
-                          ensure_ascii=False)}],
-            tools=[TOOL],
-            tool_choice={"type": "function", "function": {"name": "propose_copy"}},
-            temperature=0.4,
-        )
+        try:
+            r = _client().chat.completions.create(**base, **_call_kwargs(model))
+        except Exception as e:
+            if not _retry_without_thinking(e):
+                raise
+            kw = _call_kwargs(model)
+            kw.pop("extra_body", None)
+            r = _client().chat.completions.create(**base, **kw)
         calls = r.choices[0].message.tool_calls
         if not calls:
-            raise LLMUnavailable("no_tool_call")
+            raise LLMUnavailable(
+                f"no_tool_call (finish={r.choices[0].finish_reason})")
         raw = json.loads(calls[0].function.arguments)
         u = r.usage
         ti, to = (u.prompt_tokens, u.completion_tokens) if u else (420, 90)
-        return raw, _meta(tier, model, ti, to)
+        meta = _meta(tier, model, ti, to)
+        meta["latency_s"] = round(_t.time() - _t0, 2)
+        if meta["latency_s"] > C.LATENCY_BUDGET_SECONDS:
+            # 聊天窗口里超时比话术差严重得多，超预算必须可见
+            print(f"LATENCY_BUDGET_EXCEEDED model={model} "
+                  f"{meta['latency_s']}s > {C.LATENCY_BUDGET_SECONDS}s")
+        return raw, meta
     except Exception as e:
         # 生成失败不能让用户卡住：降级到模板，照样把方案给出去
         out = mock_copy(ctx, offers)
