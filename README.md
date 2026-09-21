@@ -12,21 +12,83 @@
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install fastapi uvicorn pydantic openai pytest httpx
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env               # 填 key；不填也能跑
 .venv/bin/python -m uvicorn app:app --port 8777
 bash demo.sh                       # 12 段全流程演示
 .venv/bin/python -m pytest tests -q # 26 个 e2e 测试
 ```
 
-**无需 API key 即可完整演示**：没 key 时自动降级到确定性 mock，断网/限流也不翻车。
-接真 LLM（默认智谱 GLM，OpenAI 兼容端点）：
-
-```bash
-export GLM_API_KEY=<your key>
-# 换厂商：export RS_LLM_BASE_URL=... RS_MODEL_INTENT=... RS_MODEL_SMALL=... RS_MODEL_LARGE=...
-```
+**零配置即可完整演示**：没 key 时 LLM 自动降级到确定性 mock、Langfuse 变 no-op、存储走内存，断网/限流都不翻车。
 
 > 本机若开着代理，`curl` 需加 `--noproxy '*'`，否则 localhost 会被代理劫持。
+
+## 配置（`.env`）
+
+全部配置集中在 `config.py`，从 `.env` 读取。优先级：**真实环境变量 > `.env` > 代码默认值**——容器里注入的 secret 永远赢。`.env` 已在 `.gitignore`，模板见 [`.env.example`](.env.example)。
+
+`GET /health` 如实反映各项配置状态，且**绝不回显任何密钥本身**。
+
+### LLM（OpenAI 兼容端点，默认智谱 GLM）
+
+```bash
+RS_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+RS_LLM_API_KEY=<your key>          # 或 GLM_API_KEY
+RS_MODEL_INTENT=glm-4-flash        # 意图+情绪，最便宜那档
+RS_MODEL_SMALL=glm-4-air           # 常规话术
+RS_MODEL_LARGE=glm-4-plus          # 高情绪/高客单/二轮僵持
+RS_COST_BUDGET=0.05                # 单会话成本硬预算，超了强制降模板
+```
+
+换厂商只改这几行，代码一行不动。
+
+### Langfuse 可观测性
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com   # US 区 us.cloud / 自托管填自己的
+```
+
+两把 key 齐了才启用，缺任何一把整体降级成 no-op——**埋点绝不能拖垮主流程**。启用后：
+
+- `llm.py` 的客户端自动换成 `langfuse.openai` 的 drop-in，prompt/completion/token/成本/延迟全自动上报
+- 每次 `/api/negotiate` 是一个 span，`session_id` 串起整段对话，`customer_id` 作为 user
+- 四个分数（命名按**信号来源**而非期望衡量的东西）：
+
+| 分数名 | 类型 | 含义 |
+|---|---|---|
+| `user-csat` | NUMERIC | 会话结束用户评分 1–5（`POST /api/csat`） |
+| `guardrail-trip` | BOOLEAN | 本次会话是否触发过护栏 |
+| `experience-violation` | BOOLEAN | 是否违反体验不变量 |
+| `retention-outcome` | CATEGORICAL | `offer_made` / `declined` / `instant_refund` / `escalated` / `released` |
+
+### PostgreSQL
+
+```bash
+RS_STORE_BACKEND=postgres          # 默认 memory
+DATABASE_URL=postgresql://returnsaver:returnsaver@localhost:5432/returnsaver
+RS_DB_POOL_MIN=1
+RS_DB_POOL_MAX=10
+```
+
+建库建表：
+
+```bash
+psql -d postgres -c "CREATE ROLE returnsaver LOGIN PASSWORD 'returnsaver';" \
+                 -c "CREATE DATABASE returnsaver OWNER returnsaver;"
+psql "$DATABASE_URL" -f db/schema.sql
+```
+
+**只持久化丢了会出事的三张表**——订单与客户仍走 mock（case 要求不接真 Shopify）：
+
+| 表 | 丢了会怎样 |
+|---|---|
+| `sessions` | 用户要重新确认订单 |
+| `executions` | **重复发钱**（幂等键唯一约束兜底） |
+| `manual_tickets` | 违反 SLA 承诺（带 `due_at`，`/api/manual-queue` 直接算 `sla_breached`） |
+
+内存永远是真相源，Postgres 用于重启恢复与离线分析。**库连不上时所有写操作静默降级**，主流程不受影响（`/health` 会如实报 `ok:false` + 错误原因）。
 
 ---
 
@@ -120,13 +182,18 @@ experience_violations         : 0
 | AI coding | Cursor + Claude Opus 5 | — |
 | 后端 | FastAPI + Pydantic v2 | **护栏即 Schema** |
 | LLM | 智谱 GLM 三档（flash / air / plus），OpenAI 兼容 | 换厂商只改环境变量 |
-| 数据 | MVP 内存 mock；上线 Supabase(Postgres) | `store.py` 接口签名不变 |
+| 可观测 | Langfuse v4（OpenAI drop-in + scores） | 换个 import 就有全链路 trace |
+| 数据 | 内存（默认）/ PostgreSQL 16 | 已实测双写落库 |
 | 部署 | Railway / Fly.io | — |
 
 ## 文件结构
 
 ```
-config.py       阈值与开关（模型、价格表、体验不变量、商业口径）
+.env.example    配置模板（LLM / Langfuse / PostgreSQL / 策略阈值）
+config.py       从 .env 读取全部配置 + summary() 供 /health
+observability.py Langfuse 接入（traced OpenAI drop-in / span / score），未配置则 no-op
+db.py           PostgreSQL 连接池与三张表的读写，memory 模式下全 no-op
+db/schema.sql   建表脚本
 models.py       枚举 + Pydantic Schema（L1 收窄动作空间）
 store.py        mock 数据（7 客户 / 7 订单覆盖全场景）+ 会话 + 知识库
 policy.py       规则核验 / 场景分类 / 分级退款 / 方案白名单
@@ -140,8 +207,9 @@ demo.sh         12 段演示脚本
 
 ## 已知边界（MVP 范围外）
 
-- 会话状态在内存，重启即丢；生产需 Redis/Postgres
 - `MODEL_PRICING` 是量级占位值，上线前必须按厂商合同价替换
-- **真 LLM 路径尚未用真实 key 验证过**，当前所有数据来自确定性 mock 路径
+- **真 LLM 路径尚未用真实 key 验证过**，当前所有成本数字来自确定性 mock 路径
+- **Langfuse 埋点尚未用真实 key 验证过**（代码按 v4 官方文档写，本地只验了 no-op 降级）
+- Postgres 已本地实测落库；但 `load_session` 尚未接回读路径，重启后仍从内存重建
 - 情绪识别靠词典 + 小模型，未做多语言（跨境场景需补西/法/德语词典）
 - 人工工单队列是内存 list，未接 Zendesk/Gorgias

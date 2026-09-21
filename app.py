@@ -5,24 +5,33 @@
 """
 from __future__ import annotations
 
-import os
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 import config as C
+import db
 import guardrails as G
 import llm
 import metrics
+import observability as obs
 import policy
 import store
 from models import (Action, AcceptRequest, Intent, ModelTier, NegotiateRequest,
                     ReturnReason, Scenario, Stage)
 
-app = FastAPI(title="Return Saver", version="0.2.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    obs.flush()      # 短生命周期容器不 flush 会丢 trace
+    db.close()
 
-HOLDOUT_PCT = int(os.getenv("RS_HOLDOUT_PCT", "0"))   # 生产置 10：对照组做增量归因
+
+app = FastAPI(title="Return Saver", version="0.3.0", lifespan=lifespan)
+
+HOLDOUT_PCT = C.HOLDOUT_PCT           # 生产置 10：对照组做增量归因
 ESCAPE = "随时回「还是要退」，我立刻转标准退货，不会多问一句。"
 
 
@@ -40,7 +49,14 @@ def _ok(session: store.Session, payload: dict, allow_retention: bool = True) -> 
         metrics.record_guardrail(e.layer, e.code)
         session.guardrail_trips.append({"layer": e.layer, "code": e.code, "detail": e.detail})
         print(f"EXPERIENCE_VIOLATION code={e.code} session={session.session_id} detail={e.detail}")
+        obs.score(session.session_id, "experience-violation", True,
+                  data_type="BOOLEAN", comment=e.code)
         payload["experience_warning"] = {"code": e.code, "detail": e.detail}
+    if payload.get("status") in ("offer_made", "declined", "instant_refund",
+                                 "escalated", "released"):
+        obs.score(session.session_id, "retention-outcome", payload["status"],
+                  data_type="CATEGORICAL")
+    store.persist(session)
     return payload
 
 
@@ -49,6 +65,9 @@ def _blocked(session: store.Session, trip: G.GuardrailTripped) -> JSONResponse:
     session.guardrail_trips.append({"layer": trip.layer, "code": trip.code, "detail": trip.detail})
     print(f"GUARDRAIL_TRIGGERED layer={trip.layer} code={trip.code} "
           f"session={session.session_id} detail={trip.detail}")
+    obs.score(session.session_id, "guardrail-trip", True, data_type="BOOLEAN",
+              comment=f"{trip.layer}:{trip.code}")
+    store.persist(session)
     return JSONResponse(status_code=422, content={
         "session_id": session.session_id,
         "status": "guardrail_blocked",
@@ -78,6 +97,20 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
 # ════════════════════════════════════════════ 主入口
 @app.post("/api/negotiate")
 def negotiate(req: NegotiateRequest):
+    """一次调用 = 一个 Langfuse span，session_id 把整段对话串起来。"""
+    with obs.session_trace(req.session_id or "new", req.customer_id, req.message) as span:
+        out = _negotiate(req)
+        body = out.body if isinstance(out, JSONResponse) else out
+        if span is not None and not isinstance(out, JSONResponse):
+            obs.update(span, output={"status": out.get("status"),
+                                     "scenario": out.get("scenario"),
+                                     "action": out.get("action")},
+                       metadata={"cost_usd": out.get("cost_usd"),
+                                 "stage": out.get("stage")})
+        return out
+
+
+def _negotiate(req: NegotiateRequest):
     session = store.get_session(req.session_id) or store.new_session(req.customer_id)
     if req.customer_id:
         session.customer_id = req.customer_id
@@ -274,6 +307,8 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
               "anomalies": pl["anomalies"], "amount": order["total"],
               "created_at": int(time.time())}
     store.MANUAL_QUEUE.append(ticket)
+    db.enqueue_ticket(ticket, customer_id=session.customer_id,
+                      session_id=session.session_id)
     reply = (f"这单金额比较大，我不想让机器替你做决定。已经转给专人，"
              f"{pl['sla_hours']} 小时内一定给你答复，工单号 {ticket['ticket_id']}。"
              f"在那之前退货权益不受影响，窗口我已经帮你冻结。")
@@ -303,17 +338,21 @@ def accept(req: AcceptRequest):
     result = {"order_id": payload["order_id"], "offer_id": payload["offer_id"],
               "value": payload["value"], "executed_at": int(time.time())}
     store.EXECUTED[req.idempotency_key] = result
+    db.record_execution(req.idempotency_key, payload["order_id"],
+                        payload["offer_id"], payload["value"])
     return {"status": "executed", **result}
 
 
 # ════════════════════════════════════════════ 运维 / 看板
 @app.get("/health")
 def health():
-    return {"ok": True, "env": C.ENV,
-            "llm": "real" if C.USE_REAL_LLM else "mock",
-            "models": {"intent": C.MODEL_INTENT, "small": C.MODEL_SMALL,
-                       "large": C.MODEL_LARGE},
-            "holdout_pct": HOLDOUT_PCT}
+    """报配置状态，绝不回显任何密钥本身。"""
+    cfg = C.summary()
+    cfg["ok"] = True
+    cfg["llm_mode"] = "real" if C.USE_REAL_LLM else "mock"
+    cfg["langfuse"]["client_ready"] = obs.enabled()
+    cfg["store"] = db.ping()
+    return cfg
 
 
 @app.get("/api/metrics")
@@ -328,10 +367,17 @@ def get_policy():
 
 @app.get("/api/manual-queue")
 def manual_queue():
-    return {"pending": len(store.MANUAL_QUEUE), "tickets": store.MANUAL_QUEUE}
+    if db.enabled():
+        rows = db.open_tickets()
+        return {"pending": len(rows), "source": "postgres", "tickets": rows}
+    return {"pending": len(store.MANUAL_QUEUE), "source": "memory",
+            "tickets": store.MANUAL_QUEUE}
 
 
 @app.post("/api/csat")
 def csat(score: int, session_id: str | None = None):
+    """会话结束后的用户评分 1-5。同时进本地看板和 Langfuse scores。"""
     metrics.record_csat(score)
-    return {"ok": True, "recorded": score}
+    if session_id:
+        obs.score(session_id, "user-csat", float(score), data_type="NUMERIC")
+    return {"ok": True, "recorded": score, "langfuse": obs.enabled()}

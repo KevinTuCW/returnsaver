@@ -162,6 +162,13 @@ def new_session(customer_id: str | None) -> Session:
     return s
 
 
+def persist(s: Session) -> None:
+    """双写：内存永远是真相源，Postgres 用于重启恢复与离线分析。
+    backend=memory 时整个函数是 no-op。"""
+    import db
+    db.save_session(s)
+
+
 def get_session(session_id: str | None) -> Session | None:
     return SESSIONS.get(session_id) if session_id else None
 

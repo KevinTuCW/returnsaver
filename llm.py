@@ -20,8 +20,9 @@ def price(model: str, tok_in: int, tok_out: int) -> float:
 
 
 def _client():
-    from openai import OpenAI
-    return OpenAI(api_key=C.LLM_API_KEY, base_url=C.LLM_BASE_URL)
+    """开了 Langfuse 就是带 tracing 的 drop-in 客户端，否则原生 OpenAI。调用方无感。"""
+    import observability as obs
+    return obs.openai_client()
 
 
 # ════════════════════════════════════════════ 第一级：规则快路（零成本）

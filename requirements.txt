@@ -2,5 +2,8 @@ fastapi
 uvicorn
 pydantic
 openai
+python-dotenv
+langfuse>=4.0
+psycopg[binary,pool]
 pytest
 httpx
