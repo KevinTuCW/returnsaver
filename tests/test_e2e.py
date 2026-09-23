@@ -271,3 +271,131 @@ def test_metrics_reports_both_deflection_definitions():
     ns = metrics.snapshot()["north_star"]
     assert "addressable_deflection_rate" in ns
     assert "overall_deflection_rate" in ns
+
+
+# ════════════════════════════════ 回归：Code Review 修掉的 8 个问题
+def test_ineligible_decline_never_routes_to_model():
+    """情绪中档（0.45≤e<0.70）的不合规单曾绕过模板走大模型，
+    产出一条没有规则依据的婉拒，而断言只认 status 所以静默放行。"""
+    _, r = full("C-003", "ORD-1003", "I'm disappointed, I want to return this jacket")
+    assert r["scenario"] == "not_eligible"
+    assert r["status"] == "declined"
+    assert r["cited_rules"], "婉拒必须附规则原文，不论情绪高低"
+    assert r["model_calls"][-1]["tier"] == "none", "婉拒是确定性内容，不该花钱走模型"
+    assert r.get("experience_warning") is None
+
+
+def test_decline_invariant_keys_off_action_not_just_status():
+    """哪怕以后又有新分支写出 status!='declined' 的婉拒，断言也要拦住。"""
+    import guardrails as G
+    with pytest.raises(G.GuardrailTripped) as e:
+        G.assert_experience_invariants(
+            {"escape_hatch": "x", "status": "offer_made",
+             "action": "decline_with_rules"}, True)
+    assert e.value.code == "DECLINE_WITHOUT_RULE"
+
+
+def test_angry_user_with_ineligible_order_gets_no_retention():
+    """情绪硬阈值必须压过合规性判定：曾因先判 eligible 而对发火用户继续推挽留。"""
+    _, r = full("C-003", "ORD-1003", "This is ridiculous! I want my money back NOW! 投诉!")
+    assert r["scenario"] == "emotional_insist"
+    assert r["offer"] is None, "情绪超阈值禁止任何挽留 offer"
+    # 不合规不能自动秒退，必须转人工，并把规则带给人工
+    assert r["status"] == "escalated"
+    assert "not_eligible" in r["ticket"]["anomalies"]
+    assert any(c["code"] == "R-WINDOW" for c in r["ticket"]["cited_rules"])
+
+
+def test_abuse_cooldown_releases_without_tripping_guardrail():
+    """冷静期给的是空 offers，继续往下走会被 L2 白名单必然拦下，
+    把一条正常业务路径变成 422 护栏拦截。"""
+    code, r = full("C-007", "ORD-1008", "I changed my mind, I want to return")
+    assert code == 200, "冷静期是业务决策，不是护栏故障"
+    assert r["status"] == "released"
+    assert r["release_reason"] == "abuse_cooldown"
+    assert r["offer"] is None
+    assert metrics.snapshot()["guardrail_trips"] == {}, "不该污染护栏指标"
+
+
+def test_one_session_counts_as_one_conversation():
+    """两轮挽留曾被记成两段会话，且会话累计成本被重复累加。"""
+    _, first = neg(customer_id="C-001", message="It's too small, I want a return")
+    sid = first["session_id"]
+    last = None
+    for msg in ("too small", "still want to return"):
+        _, last = neg(session_id=sid, customer_id="C-001", message=msg,
+                      confirm_order_id="ORD-1001")
+    snap = metrics.snapshot()
+    assert snap["conversations"] == 1
+    assert sum(snap["actions"].values()) == 1
+    assert snap["cost"]["llm_cost_usd_total"] == pytest.approx(last["cost_usd"]), \
+        "看板成本必须等于会话实际累计成本"
+
+
+def test_holdout_bucket_stable_across_processes():
+    """曾用内建 hash()：字符串 hash 每进程带随机种子，同一会话换 worker 就换实验臂。"""
+    import subprocess
+    code = ("import sys; sys.path.insert(0,'.'); "
+            "from app import _holdout_bucket; print(_holdout_bucket('S-abc123def456'))")
+    root = str(Path(__file__).resolve().parents[1])
+    outs = [subprocess.run([sys.executable, "-c", code], cwd=root, text=True,
+                           capture_output=True).stdout.strip() for _ in range(3)]
+    buckets = {int(o) for o in outs}      # 空输出（函数不存在）会直接 ValueError
+    assert len(buckets) == 1, f"跨进程分桶不稳定：{outs}"
+    assert 0 <= buckets.pop() < 100
+
+
+def test_accept_stays_idempotent_after_restart(monkeypatch):
+    """内存幂等表活不过重启，光靠它会对同一个 key 二次执行 = 二次发钱。"""
+    import datetime as dt
+
+    import db
+    import store as S
+    _, r = full("C-001", "ORD-1001", "It's too small, I want a return")
+    tok = r["offer_token"]
+    a = client.post("/api/accept",
+                    json={"offer_token": tok, "idempotency_key": "k-boot"}).json()
+    assert a["status"] == "executed"
+
+    # 模拟重启：内存表清空，但库里那行还在
+    row = {"order_id": a["order_id"], "offer_id": a["offer_id"], "value": a["value"],
+           "executed_at": dt.datetime.fromtimestamp(a["executed_at"], dt.timezone.utc)}
+    S.EXECUTED.clear()
+    monkeypatch.setattr(db, "get_execution", lambda key: row if key == "k-boot" else None)
+
+    b = client.post("/api/accept",
+                    json={"offer_token": tok, "idempotency_key": "k-boot"}).json()
+    assert b["status"] == "already_executed", "重启后重放不得二次发钱"
+    assert b["executed_at"] == a["executed_at"]
+
+
+def test_csat_rejects_out_of_range_scores():
+    """无鉴权的写接口，放一个 99 进来就能把 avg_csat 带偏。"""
+    assert client.post("/api/csat?score=5").status_code == 200
+    for bad in (0, 6, 99, -3):
+        assert client.post(f"/api/csat?score={bad}").status_code == 422, bad
+    assert metrics.snapshot()["experience"]["avg_csat"] == 5.0
+
+
+def test_used_item_blocks_only_no_reason_returns():
+    """R-USED 原文是"不支持无理由退货"：使用类问题必须先用过才会发现，
+    尺码试穿也不算明显使用，拿这条挡人会踩体验红线。"""
+    import policy
+    from models import ReturnReason as RR
+    from store import ORDERS
+    used = ORDERS["ORD-1004"]      # used=True，窗口内
+    assert used["used"] is True
+    assert policy.check_eligibility(used, RR.USAGE)["eligible"]
+    assert policy.check_eligibility(used, RR.SIZE_FIT)["eligible"]
+    assert policy.check_eligibility(used, RR.DAMAGED)["eligible"]
+    blocked = policy.check_eligibility(used, RR.CHANGED_MIND)
+    assert not blocked["eligible"]
+    assert any(code == "R-USED" for code, _ in blocked["violated"])
+
+
+def test_escalation_ticket_ids_are_unique():
+    """ticket_id 曾只用秒级时间戳，同一秒内两次升级撞 id，
+    入库是 ON CONFLICT DO NOTHING，第二张工单被静默丢掉。"""
+    ids = [full("C-006", "ORD-1006", "This is unacceptable, refund NOW!")[1]["ticket"]["ticket_id"]
+           for _ in range(3)]
+    assert len(set(ids)) == 3, ids

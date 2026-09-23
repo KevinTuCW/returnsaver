@@ -5,10 +5,12 @@
 """
 from __future__ import annotations
 
+import hashlib
 import time
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 import config as C
@@ -84,10 +86,17 @@ def _track(session: store.Session, meta: dict) -> None:
     session.model_calls.append(meta)
 
 
+def _holdout_bucket(session_id: str) -> int:
+    """0-99 的稳定分桶。不能用内建 hash()——字符串 hash 每个进程带随机种子，
+    同一个 session_id 换个 worker / 重启一次就会换实验臂，增量归因直接作废。"""
+    return int(hashlib.sha256(session_id.encode()).hexdigest()[:8], 16) % 100
+
+
 def _release(session: store.Session, reply: str, reason: str) -> dict:
     session.stage = Stage.CLOSED
     session.outcome = "released"
-    metrics.record_conversation(session.scenario or "n/a", Action.STANDARD_RETURN.value,
+    metrics.record_conversation(session.session_id, session.scenario or "n/a",
+                                Action.STANDARD_RETURN.value,
                                 session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
     return _ok(session, {"status": "released", "reply": reply, "offer": None,
@@ -182,9 +191,10 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     session.order_id = order_id
 
     # 对照组：不做任何挽留，用于增量归因
-    if HOLDOUT_PCT and (hash(session.session_id) % 100) < HOLDOUT_PCT:
+    if HOLDOUT_PCT and _holdout_bucket(session.session_id) < HOLDOUT_PCT:
         session.scenario = "holdout"
-        metrics.record_conversation("holdout", Action.STANDARD_RETURN.value,
+        metrics.record_conversation(session.session_id, "holdout",
+                                    Action.STANDARD_RETURN.value,
                                     session.llm_cost_usd,
                                     [m["tier"] for m in session.model_calls], holdout=True)
         session.stage = Stage.CLOSED
@@ -206,9 +216,18 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         res = policy.build_resolution(order, customer, scenario, elig, session.round)
         return _emotional(session, order, res["action"], res["payload"])
 
-    session.round += 1     # 到这里才是真正的一轮挽留；让利阶梯按这个数加码
-    res = policy.build_resolution(order, customer, scenario, elig, session.round)
+    # 先按"假如这是下一轮"算方案，确认真要挽留了才把额度记上去
+    res = policy.build_resolution(order, customer, scenario, elig, session.round + 1)
     action, offers, allow_retention = res["action"], res["offers"], res["allow_retention"]
+
+    # 策略层判定不该再挽留（薅羊毛冷静期等）：直接放行标准退货。
+    # 不能继续往下走——offers 为空会让 L2 白名单校验必然抛错，
+    # 把一条正常业务路径变成 422 护栏拦截，还污染护栏指标。
+    if action is Action.STANDARD_RETURN or not offers:
+        return _release(session, "这单我直接给你走退货，不再给你推别的方案。",
+                        res["payload"].get("reason", "no_offer_available"))
+
+    session.round += 1     # 到这里才是真正的一轮挽留；让利阶梯按这个数加码
 
     # 生成侧动态路由
     tier, route_reason = llm.route_generation(
@@ -228,18 +247,20 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
 
     # 模板档：不过 LLM，直接渲染确定性文案
     if tier is ModelTier.NONE and not req.force:
-        return _template_reply(session, order, scenario, action, offers, res["payload"])
+        return _template_reply(session, order, scenario, action, offers,
+                               res["payload"], allow_retention)
 
     # ── L2 / L3 护栏
     try:
-        proposal = G.validate_proposal(raw, allowed_ids, order)
+        proposal = G.validate_proposal(raw, allowed_ids)
         offer = next(o for o in offers if o["offer_id"] == proposal.offer_id)
         G.validate_value_cap(offer, order)
         G.scan_output_text(proposal.message, approved)
     except G.GuardrailTripped as e:
         return _blocked(session, e)
 
-    metrics.record_conversation(scenario.value, action.value, session.llm_cost_usd,
+    metrics.record_conversation(session.session_id, scenario.value, action.value,
+                                session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
     payload = {
         "status": "offer_made", "scenario": scenario.value, "action": action.value,
@@ -257,9 +278,11 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
 
 # ════════════════════════════════════════════ 确定性模板分支（零 LLM 成本）
 def _template_reply(session: store.Session, order: dict, scenario: Scenario,
-                    action: Action, offers: list[dict], pl: dict) -> dict:
-    metrics.record_conversation(scenario.value, action.value, session.llm_cost_usd,
-                               [m["tier"] for m in session.model_calls])
+                    action: Action, offers: list[dict], pl: dict,
+                    allow_retention: bool = True) -> dict:
+    metrics.record_conversation(session.session_id, scenario.value, action.value,
+                                session.llm_cost_usd,
+                                [m["tier"] for m in session.model_calls])
     if scenario is Scenario.NOT_ELIGIBLE:
         cited = [{"code": c, "text": t} for c, t in pl["violated"]]
         alt = offers[0] if offers else None
@@ -270,7 +293,7 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
              "offer": alt, "next_action": "await_customer_decision"}
         if alt:
             p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
-        return _ok(session, p)
+        return _ok(session, p, allow_retention)
 
     alt = offers[0] if offers else None
     p = {"status": "offer_made", "scenario": scenario.value, "action": action.value,
@@ -278,14 +301,14 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
          "next_action": "await_customer_decision"}
     if alt:
         p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
-    return _ok(session, p)
+    return _ok(session, p, allow_retention)
 
 
 # ════════════════════════════════════════════ 情绪激烈：分级处理
 def _emotional(session: store.Session, order: dict, action: Action, pl: dict) -> dict:
     session.stage = Stage.CLOSED
-    metrics.record_conversation(Scenario.EMOTIONAL_INSIST.value, action.value,
-                                session.llm_cost_usd,
+    metrics.record_conversation(session.session_id, Scenario.EMOTIONAL_INSIST.value,
+                                action.value, session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
     if action is Action.INSTANT_REFUND:
         session.outcome = "instant_refund"
@@ -304,10 +327,16 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 
     # 大额 / 异常 → 人工介入，但必须给死时效
     session.outcome = "escalated"
-    ticket = {"ticket_id": f"T-{int(time.time())}", "order_id": order["order_id"],
+    # ticket_id 必须带随机尾巴：只用秒级时间戳的话，同一秒内两次升级会撞 id，
+    # 而入库是 ON CONFLICT (ticket_id) DO NOTHING —— 第二张工单会被静默丢掉
+    ticket = {"ticket_id": f"T-{int(time.time())}-{uuid.uuid4().hex[:6]}",
+              "order_id": order["order_id"],
               "priority": pl["priority"], "sla_hours": pl["sla_hours"],
               "anomalies": pl["anomalies"], "amount": order["total"],
               "created_at": int(time.time())}
+    if pl.get("violated"):
+        # 不合规却因情绪转人工：把违反的规则带上，人工才知道为什么不能直接退
+        ticket["cited_rules"] = [{"code": c, "text": t} for c, t in pl["violated"]]
     store.MANUAL_QUEUE.append(ticket)
     db.enqueue_ticket(ticket, customer_id=session.customer_id,
                       session_id=session.session_id)
@@ -327,6 +356,15 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 def accept(req: AcceptRequest):
     if req.idempotency_key in store.EXECUTED:
         return {"status": "already_executed", **store.EXECUTED[req.idempotency_key]}
+    # 内存幂等表活不过重启，光靠它会在重启后对同一个 key 二次执行 = 二次发钱。
+    # 落了库就必须回库里问一次，这是 L4 唯一真正防重放的地方。
+    prior = db.get_execution(req.idempotency_key)
+    if prior is not None:
+        result = {"order_id": prior["order_id"], "offer_id": prior["offer_id"],
+                  "value": float(prior["value"]),
+                  "executed_at": int(prior["executed_at"].timestamp())}
+        store.EXECUTED[req.idempotency_key] = result      # 回填，后续重放不再查库
+        return {"status": "already_executed", **result}
     try:
         payload = G.verify_offer_token(req.offer_token)
     except G.GuardrailTripped as e:
@@ -377,8 +415,11 @@ def manual_queue():
 
 
 @app.post("/api/csat")
-def csat(score: int, session_id: str | None = None):
-    """会话结束后的用户评分 1-5。同时进本地看板和 Langfuse scores。"""
+def csat(score: int = Query(ge=1, le=5), session_id: str | None = None):
+    """会话结束后的用户评分 1-5。同时进本地看板和 Langfuse scores。
+
+    范围必须在接口层就框死：这是个无鉴权的写接口，放一个 99 进来
+    就能把 avg_csat 这条对外指标彻底带偏。"""
     metrics.record_csat(score)
     if session_id:
         obs.score(session_id, "user-csat", float(score), data_type="NUMERIC")

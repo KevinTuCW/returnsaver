@@ -12,7 +12,7 @@ import uuid
 from pydantic import ValidationError
 
 import config as C
-from models import CopyProposal
+from models import Action, CopyProposal
 from store import ORDERS
 
 
@@ -23,7 +23,7 @@ class GuardrailTripped(Exception):
 
 
 # ════════════════════════════════════════════ L2 Schema + 策略校验
-def validate_proposal(raw: dict, allowed_ids: set[str], order: dict) -> CopyProposal:
+def validate_proposal(raw: dict, allowed_ids: set[str]) -> CopyProposal:
     try:
         p = CopyProposal.model_validate(raw)
     except ValidationError as e:
@@ -103,6 +103,9 @@ def assert_experience_invariants(reply: dict, allow_retention: bool) -> None:
     if inv["no_retention_when_angry"] and not allow_retention and reply.get("offer"):
         raise GuardrailTripped("EXP", "RETENTION_WHEN_BLOCKED",
                                "该场景禁止挽留，但回复里仍带了挽留 offer")
-    if inv["decline_must_cite_rule"] and reply.get("status") == "declined" \
-            and not reply.get("cited_rules"):
+    # 认 action 而不只认 status：status="declined" 只有模板分支会写，
+    # 光看它的话，任何"走了模型的婉拒"都能从这条断言底下溜过去
+    is_decline = (reply.get("status") == "declined"
+                  or reply.get("action") == Action.DECLINE_WITH_RULES.value)
+    if inv["decline_must_cite_rule"] and is_decline and not reply.get("cited_rules"):
         raise GuardrailTripped("EXP", "DECLINE_WITHOUT_RULE", "婉拒未附规则原文")

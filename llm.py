@@ -169,8 +169,11 @@ def route_generation(scenario: Scenario, emotion: float, order_value: float,
     """决定这次回复用哪一档。返回 (档位, 理由)。"""
     if spent >= C.CONVERSATION_COST_BUDGET_USD:
         return ModelTier.NONE, "cost_budget_exhausted"
-    # 婉拒和手册推送是确定性内容，模板比模型更稳、更合规，且零成本
-    if scenario is Scenario.NOT_ELIGIBLE and emotion < C.EMOTION_LARGE_MODEL:
+    # 婉拒是确定性内容，模板比模型更稳、更合规，且零成本。
+    # **不看情绪**：只有模板分支会写 status="declined" + cited_rules，
+    # 走模型就等于给出一条没有规则依据的婉拒，直接违反 decline_must_cite_rule。
+    # 情绪真的高到硬阈值时，场景已经被判成 EMOTIONAL_INSIST，不会走到这里。
+    if scenario is Scenario.NOT_ELIGIBLE:
         return ModelTier.NONE, "deterministic_template"
     if scenario is Scenario.EMOTIONAL_INSIST:
         return ModelTier.NONE, "no_retention_allowed_use_template"

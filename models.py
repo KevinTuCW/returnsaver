@@ -84,7 +84,6 @@ class NegotiateRequest(BaseModel):
     customer_id: str | None = None
     message: str = Field(min_length=1, max_length=2000)
     confirm_order_id: str | None = None          # S3 用户确认订单
-    accept_offer: bool = False
     want_return_anyway: bool = False             # 体验出口：随时可放弃挽留
     force: Literal["bad_offer", "bad_text", "bad_amount"] | None = None  # 仅演示护栏
 

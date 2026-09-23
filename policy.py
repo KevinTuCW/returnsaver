@@ -37,6 +37,10 @@ def check_eligibility(order: dict, reason: ReturnReason) -> dict:
             violated.append(("R-FINAL", p["rules"]["R-FINAL"]))
         if order["category"] in ("innerwear", "swimwear") and order["opened"]:
             violated.append(("R-HYGIENE", p["rules"]["R-HYGIENE"]))
+        # R-USED 的原文是"不支持**无理由**退货"，所以只约束 changed_mind：
+        # 使用类问题必须先用过才会发现，尺码试穿也不算"明显使用"，拿这条挡人会踩体验红线
+        if order["used"] and reason is ReturnReason.CHANGED_MIND:
+            violated.append(("R-USED", p["rules"]["R-USED"]))
 
     return {
         "eligible": not violated,
@@ -49,11 +53,14 @@ def check_eligibility(order: dict, reason: ReturnReason) -> dict:
 # ──────────────────────────────────────────── S5 场景分类（要求 3 的五类）
 def classify_scenario(order: dict, reason: ReturnReason, emotion: float,
                       eligibility: dict) -> Scenario:
-    if not eligibility["eligible"]:
-        return Scenario.NOT_ELIGIBLE
-    # 情绪优先级最高：用户已经急了就别再分析原因了，直接进分级处理
+    # 情绪优先级最高，**高于合规性判定**：用户已经急了就别再分析原因了，直接进分级处理。
+    # 这一条必须排在 eligible 之前——否则"不合规 + 已发火"会落进 NOT_ELIGIBLE，
+    # allow_retention 保持 True，等于对着一个发火的用户继续推挽留方案。
+    # 不合规订单不会被自动秒退：triage_refund 把不合规记成 anomaly，强制转人工。
     if emotion >= C.EMOTION_HARD_STOP:
         return Scenario.EMOTIONAL_INSIST
+    if not eligibility["eligible"]:
+        return Scenario.NOT_ELIGIBLE
     if reason in (ReturnReason.DAMAGED, ReturnReason.QUALITY):
         return Scenario.PRODUCT_DAMAGE
     if reason == ReturnReason.USAGE:
@@ -62,7 +69,7 @@ def classify_scenario(order: dict, reason: ReturnReason, emotion: float,
 
 
 # ──────────────────────────────────────────── 分级退款（要求 3 第五类）
-def triage_refund(order: dict, customer: dict) -> tuple[Action, dict]:
+def triage_refund(order: dict, customer: dict, eligibility: dict) -> tuple[Action, dict]:
     """情绪激烈执意要退：小额立即退，大额或异常人工介入。
     人工介入必须给明确时效承诺——这是体验钩子，不是拖延。"""
     anomalies = []
@@ -72,6 +79,9 @@ def triage_refund(order: dict, customer: dict) -> tuple[Action, dict]:
         anomalies.append("high_return_frequency")
     if order["days_since_delivery"] > MERCHANT_POLICY["return_window_days"]:
         anomalies.append("outside_window")
+    # 不合规订单绝不自动秒退：情绪高也只是"不再挽留"，钱该不该退是人来判
+    if not eligibility["eligible"]:
+        anomalies.append("not_eligible")
 
     if order["total"] <= C.INSTANT_REFUND_CAP_USD and not anomalies:
         return Action.INSTANT_REFUND, {
@@ -152,10 +162,8 @@ def build_resolution(order: dict, customer: dict, scenario: Scenario,
                 "payload": {"tier_pct": tier}, "allow_retention": True}
 
     # EMOTIONAL_INSIST：分级处理，且**禁止任何挽留话术**
-    action, payload = triage_refund(order, customer)
+    action, payload = triage_refund(order, customer, eligibility)
+    if not eligibility["eligible"]:
+        # 转人工时把违反的规则一起带过去，人工才知道为什么不能直接退
+        payload["violated"] = eligibility["violated"]
     return {"action": action, "offers": [], "payload": payload, "allow_retention": False}
-
-
-def render_decline_text(violated: list[tuple[str, str]]) -> str:
-    lines = [f"· {code}：{text}" for code, text in violated]
-    return "\n".join(lines)

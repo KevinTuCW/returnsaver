@@ -97,6 +97,14 @@ ORDERS = {
         "sizes_in_stock": ["41", "43"], "repairable": False,
         "negotiations_last_90d": 4, "has_manual": False,
     },
+    "ORD-1008": {  # 完全合规 + 薅羊毛用户 → 冷静期，放行标准退货不再给券
+        "order_id": "ORD-1008", "customer_id": "C-007", "sku": "TEE-BLK-M",
+        "product": "Merino Crew Tee (Black / S)", "category": "apparel",
+        "total": 100.00, "gross_margin_pct": 0.60, "days_since_delivery": 5,
+        "final_sale": False, "opened": True, "used": False,
+        "sizes_in_stock": ["M", "L"], "repairable": False,
+        "negotiations_last_90d": 4, "has_manual": True,
+    },
 }
 
 # 使用类问题的知识库（USAGE_ISSUE 场景走这里，命中即可零 LLM 成本回答）

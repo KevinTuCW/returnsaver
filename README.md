@@ -110,7 +110,7 @@ psql "$DATABASE_URL" -f db/schema.sql
 | **S1 意图识别** | 意图 + 退货原因 + 情绪分 | 规则快路 → **小模型** | 永不调用大模型；情绪超阈值由规则直接定，不交给模型 |
 | **S2 信息校验** | 用户身份、订单归属、可退候选 | **[Code]** | 查不到就要身份信息，不猜 |
 | **S3 确认订单** | 列候选，等用户显式确认 | **[Code]** | 不确认绝不进入执行——认错单就是动错钱 |
-| **S4 规则核验** | 窗口 / final sale / 卫生 / 使用痕迹 | **[Code]** | 破损与质量走豁免通道，不受窗口限制 |
+| **S4 规则核验** | 窗口 / final sale / 卫生 / 使用痕迹 | **[Code]** | 破损与质量走豁免通道；`R-USED` 只约束无理由退货 |
 | **S5 场景执行** | 分类 → 选方案 → 生成话术 → 护栏 | **[Code]** 决策 / **[LLM]** 措辞 | 金额只从策略引擎出 |
 
 确认订单**不占用**谈判额度；`round` 只统计真正发出过的挽留轮次。
@@ -127,6 +127,8 @@ psql "$DATABASE_URL" -f db/schema.sql
 
 情绪激烈场景 **禁止任何挽留话术**（`allow_retention=False`，违反会被断言拦下）。立即退款附带 `comeback_credit` 回头钩子——把一次差体验变成下次再来的理由。
 
+情绪阈值的判定**排在合规性之前**：一个已经发火的用户，哪怕订单不合规，也不该再被推挽留方案。这类会话不会被自动秒退——不合规会被记成 anomaly 强制转人工，并把违反的规则一起带给人工。价值补偿线另有冷静期：风险用户或 90 天内谈判 ≥3 次直接放行标准退货，不再给券。
+
 ## 三、经济效率：两级意图 + 三档生成路由
 
 **意图侧**（永不用大模型）
@@ -137,7 +139,7 @@ psql "$DATABASE_URL" -f db/schema.sql
 
 | 档位 | 触发条件 | 成本 |
 |---|---|---|
-| `none`（模板） | 婉拒场景、情绪激烈场景、会话预算耗尽 | **$0** |
+| `none`（模板） | 婉拒场景（**不看情绪**）、情绪激烈场景、会话预算耗尽 | **$0** |
 | `small` | 默认 | 低 |
 | `large` | 情绪 ≥0.45 / 订单 ≥$200 / 第二轮僵持 / VIP 且 ≥$80 | 高但值得 |
 
@@ -162,7 +164,7 @@ experience_violations         : 0
 | **L1** 收窄动作空间 | LLM 只能 function call `propose_copy(offer_id ∈ 白名单)`；**结构里没有金额字段**，"退 200%" 在语法上不可表达 | — |
 | **L2** Schema + 策略校验 | Pydantic `extra=forbid` + 白名单断言 + `value ≤ 订单 30%` | `force:"bad_offer"` → 422 `OFFER_NOT_IN_ALLOWLIST` |
 | **L3** 出参文本扫描 | 正则扫金额/百分比/`keep the product`/`refund you`，未批准一律拦 | `force:"bad_text"` → `FORBIDDEN_PHRASE`；`force:"bad_amount"` → `UNAPPROVED_AMOUNT` |
-| **L4** 执行层隔离 | 动钱只认 HMAC `offer_token`（TTL 15min + 幂等键），并**独立复核**上限 | 伪造 token → `BAD_SIGNATURE`；重放 → `already_executed` |
+| **L4** 执行层隔离 | 动钱只认 HMAC `offer_token`（TTL 15min + 幂等键**内存与库双查**，重启后仍幂等），并**独立复核**上限 | 伪造 token → `BAD_SIGNATURE`；重放 → `already_executed` |
 
 **prompt 里写「不要承诺退款」不是护栏。** 哪怕前三层全崩，L4 也让模型的任何一句话动不了一分钱。
 
@@ -183,7 +185,9 @@ experience_violations         : 0
 - `addressable_deflection_rate`（主口径，对应销售主张 80%）—— 分母已排除破损/错发/超窗口
 - `overall_deflection_rate`（全量口径，预期 20–30%）
 
-配套：强制 10% holdout 对照组（`RS_HOLDOUT_PCT=10`）做增量归因，**60 天**结算窗口，二次退货回冲。
+分母是**会话**不是轮次：一段会话谈了两轮也只算一段，口径取它的最终结局，成本按会话累计值记一次。
+
+配套：强制 10% holdout 对照组（`RS_HOLDOUT_PCT=10`）做增量归因，**60 天**结算窗口，二次退货回冲。分桶走 `session_id` 的 SHA-256 摘要，不用内建 `hash()`——后者每个进程带随机种子，换 worker 或重启一次就会换实验臂，归因直接作废。
 
 商业口径、定价三档与异议应对见 [`docs/GTM-PRICING.md`](docs/GTM-PRICING.md)。
 
@@ -195,7 +199,7 @@ experience_violations         : 0
 |---|---|---|
 | AI coding | Cursor + Claude Opus 5 | — |
 | 后端 | FastAPI + Pydantic v2 | **护栏即 Schema** |
-| LLM | 智谱 GLM 三档（flash / air / plus），OpenAI 兼容 | 换厂商只改环境变量 |
+| LLM | GLM 三档（`glm-4.5-air` / `glm-5-turbo` / `glm-4.6`），OpenAI 兼容 | 换厂商只改环境变量 |
 | 可观测 | Langfuse v4（OpenAI drop-in + scores） | 换个 import 就有全链路 trace |
 | 数据 | 内存（默认）/ PostgreSQL 16 | 已实测双写落库 |
 | 部署 | Railway / Fly.io | — |
