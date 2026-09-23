@@ -11,6 +11,28 @@ j() { $PY -c "import sys,json;d=sys.stdin.read();b,_,h=d.partition('[HTTP');prin
 
 post() { c -w "\n[HTTP %{http_code}]" -X POST "$BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 
+# 前置检查：服务没起的话，后面每一段都会喷一屏 JSON 解析 traceback，
+# 真正的原因反而看不见。宁可在这里一句话说清就退出。
+# 要等而不是立刻失败：配了 Langfuse 的话，import 时要做一次 auth_check，
+# 冷启动到能服务约 4s，刚起完服务就跑 demo 会撞上这个窗口。
+ready=""
+for _ in $(seq 1 20); do
+  c -m 2 -o /dev/null "$BASE/health" && { ready=1; break; }
+  sleep 1
+done
+if [ -z "$ready" ]; then
+  echo "✗ 连不上 $BASE"
+  echo
+  echo "  demo.sh 只是个 HTTP 客户端，不会自己起服务。先在**另一个终端**跑："
+  echo "      $PY -m uvicorn app:app --port 8777"
+  echo
+  echo "  或者后台起（日志给 demo.sh 末尾的护栏日志用）："
+  echo "      $PY -m uvicorn app:app --port 8777 > /tmp/rs.log 2>&1 &"
+  echo
+  echo "  换端口：BASE=http://localhost:9999 bash demo.sh"
+  exit 1
+fi
+
 # 走完 S1→S3→S5：第一次拿 session + 确认列表，第二次带 confirm_order_id 推进
 flow() {  # flow <标题> <customer> <order> <message> [extra-json]
   echo; echo "═══════════ $1"

@@ -14,10 +14,20 @@
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env               # 填 key；不填也能跑
-.venv/bin/python -m uvicorn app:app --port 8777
-bash demo.sh                        # 12 段全流程演示
-.venv/bin/python -m pytest tests -q # 26 个 e2e 测试（强制 mock，不走网络）
+```
+
+测试不需要服务，直接跑：
+
+```bash
+.venv/bin/python -m pytest tests -q      # 36 个 e2e 测试（强制 mock，不走网络）
 .venv/bin/python scripts/verify_live.py  # 真实 LLM + Langfuse 链路验证
+```
+
+`demo.sh` 是纯 HTTP 客户端，**要先把服务起起来**（uvicorn 是前台阻塞的，所以后台起或另开一个终端）：
+
+```bash
+.venv/bin/python -m uvicorn app:app --port 8777 > /tmp/rs.log 2>&1 &
+bash demo.sh                        # 12 段全流程演示，末尾会读 /tmp/rs.log 的护栏日志
 ```
 
 测试与真实链路验证**刻意分开**：`tests/conftest.py` 清空凭证强制走 mock，保证测试 1 秒跑完、不花钱、不因模型抖动假失败；真实链路由 `verify_live.py` 单独验。
@@ -213,13 +223,13 @@ observability.py Langfuse 接入（traced OpenAI drop-in / span / score），未
 db.py           PostgreSQL 连接池与三张表的读写，memory 模式下全 no-op
 db/schema.sql   建表脚本
 models.py       枚举 + Pydantic Schema（L1 收窄动作空间）
-store.py        mock 数据（7 客户 / 7 订单覆盖全场景）+ 会话 + 知识库
+store.py        mock 数据（7 客户 / 8 订单覆盖全场景）+ 会话 + 知识库
 policy.py       规则核验 / 场景分类 / 分级退款 / 方案白名单
 llm.py          规则快路 + 小模型意图 + 三档生成路由 + 成本核算
 guardrails.py   L2/L3/L4 + 体验不变量断言
 metrics.py      双口径挽留率 / 成本 / 路由分布 / 护栏触发
 app.py          五阶段编排 + API
-tests/test_e2e.py  26 个端到端测试
+tests/test_e2e.py  36 个端到端测试
 demo.sh         12 段演示脚本
 ```
 
