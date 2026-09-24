@@ -29,8 +29,25 @@ Return Saver 在**不损伤用户体验**的前提下挽留退货。流程被拆
 
 `scripts/verify_live.py` 验证 6 个真实场景、3 条护栏与 CSAT 上报。最近一次实测均成本为 `$0.001102`/会话，路由分布为 `none 13 / large 2 / small 1`；规则快路与确定性模板是主要节省来源。
 
+## 🖥️ 操作界面
+
+### 用户端
+
+Helpmate 内嵌 Return Saver，客户可以确认订单、查看挽留方案并继续标准退货流程。
+
+![Return Saver customer experience](images/RS%20customer%20side.jpeg)
+
+### 商家端
+
+商家在 Return Saver Admin 中查看经营指标与历史咨询，并维护售后规则。
+
+| Dashboard | Chats | Policy |
+|---|---|---|
+| ![Merchant dashboard](images/RS%20merchant%20dashboard.jpeg) | ![Merchant chats](images/RS%20merchant%20chats.jpeg) | ![Merchant policy](images/RS%20merchant%20policy.jpeg) |
+
 ## 📑 目录
 
+- [🖥️ 操作界面](#️-操作界面)
 - [✨ 特性](#-特性)
 - [🏗️ 架构](#️-架构)
 - [🧱 技术栈](#-技术栈)
@@ -128,13 +145,13 @@ POST /api/accept ─▶ L4 幂等（内存 + 库双查）→ 验签 → 过期�
 ## 🧱 技术栈
 
 | 关注点 | 选型 | 理由 |
-| --- | --- | --- |
-| AI coding | Cursor + Claude Opus 5 | — |
-| API / 编排 | **FastAPI** + Pydantic v2 | **护栏即 Schema**：`extra=forbid` + 字段约束就是 L1/L2 的实现 |
+| :--- | :--- | :--- |
+| AI&nbsp;coding | Claude Code + Codex | — |
+| API&nbsp;/&nbsp;编排 | **FastAPI** + Pydantic v2 | **护栏即 Schema**：`extra=forbid` + 字段约束就是 L1/L2 的实现 |
 | LLM | **GLM 三档**（`glm-4.5-air` 意图 / `glm-5-turbo` 常规 / `glm-4.6` 高价值），OpenAI 兼容端点 | 换厂商只改 `.env` 三行，代码一行不动；模型名与能力是**实测**选定，见 [`docs/MODEL-SELECTION.md`](docs/MODEL-SELECTION.md) |
-| 生成契约 | OpenAI **function calling**（`tool_choice` 强制） | 让模型只能产出 `{offer_id, message}`，自由文本无处可去 |
+| 生成&nbsp;契约 | OpenAI **function calling**（`tool_choice` 强制） | 让模型只能产出 `{offer_id, message}`，自由文本无处可去 |
 | 可观测 | **Langfuse v4**（`langfuse.openai` drop-in + scores） | 换个 import 就有 prompt/token/成本/延迟全链路 |
-| 执行层信任 | **HMAC-SHA256** 签名 token（TTL 15min + `jti`） | 动钱这一步不信任上游任何输入，只信自己的签名 |
+| 执行层&nbsp;信任 | **HMAC-SHA256** 签名 token（TTL 15min + `jti`） | 动钱这一步不信任上游任何输入，只信自己的签名 |
 | 数据 | 内存（默认）/ **PostgreSQL 16**（可选） | 会话恢复、幂等、工单、租户配置与历史咨询持久化 |
 | 测试 | pytest + `TestClient` | 177 个离线测试，不花钱、不受模型波动影响 |
 | 部署 | Railway / Fly.io | — |
@@ -143,20 +160,16 @@ POST /api/accept ─▶ L4 幂等（内存 + 库双查）→ 验签 → 过期�
 
 ## 🚀 快速开始
 
-**前置**：Python 3.12+。默认运行时**完全离线、确定性**，无需任何 key。
+**前置**：Python 3.12+。默认运行时完全离线、确定性，无需任何 key。
 
 ```bash
-# 1. 建虚拟环境并安装
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env        # 填 key；不填也能跑
-
-# 2. 跑测试（不需要起服务，强制 mock、不走网络）
-.venv/bin/python -m pytest tests -q          # → 177 passed
-
-# 3. 真实链路验证（打真 LLM + 上报真 Langfuse，需要 key）
-.venv/bin/python scripts/verify_live.py      # → 6 场景 + 3 护栏 + CSAT 全过
+make install               # 创建 .venv 并安装依赖
+cp .env.example .env       # 可选：填写 LLM、Langfuse、PostgreSQL 配置
+make test                  # 177 passed，强制 mock、不访问网络
+make run                   # http://localhost:8777/admin
 ```
+
+可通过 `PORT=8788 make run` 指定端口。真实 LLM 与 Langfuse 链路使用 `.venv/bin/python scripts/verify_live.py` 验证。
 
 `demo.sh` 是纯 HTTP 客户端，**要先把服务起起来**（uvicorn 是前台阻塞的，所以后台起或另开一个终端）：
 
@@ -241,11 +254,11 @@ curl -s --noproxy '*' -X POST localhost:8777/api/accept \
 
 | 阶段 | 做什么 | 归属 | 关键设计 |
 |---|---|---|---|
-| **S1 意图识别** | 意图 + 退货原因 + 情绪分 | 规则快路 → **小模型** | 永不调用大模型；情绪超阈值由规则直接定，不交给模型 |
-| **S2 信息校验** | 用户身份、订单归属、可退候选 | **[Code]** | 查不到就要身份信息，不猜 |
-| **S3 确认订单** | 列候选，等用户显式确认 | **[Code]** | 不确认绝不进入执行——认错单就是动错钱 |
-| **S4 规则核验** | 窗口 / final sale / 卫生 / 使用痕迹 | **[Code]** | 破损与质量走豁免通道；`R-USED` 只约束无理由退货 |
-| **S5 场景执行** | 分类 → 选方案 → 生成话术 → 护栏 | **[Code]** 决策 / **[LLM]** 措辞 | 金额只从策略引擎出 |
+| **S1&nbsp;意图识别** | 意图 + 退货原因 + 情绪分 | 规则快路 → **小模型** | 永不调用大模型；情绪超阈值由规则直接定，不交给模型 |
+| **S2&nbsp;信息校验** | 用户身份、订单归属、可退候选 | **[Code]** | 查不到就要身份信息，不猜 |
+| **S3&nbsp;确认订单** | 列候选，等用户显式确认 | **[Code]** | 不确认绝不进入执行——认错单就是动错钱 |
+| **S4&nbsp;规则核验** | 窗口 / final sale / 卫生 / 使用痕迹 | **[Code]** | 破损与质量走豁免通道；`R-USED` 只约束无理由退货 |
+| **S5&nbsp;场景执行** | 分类 → 选方案 → 生成话术 → 护栏 | **[Code]** 决策 / **[LLM]** 措辞 | 金额只从策略引擎出 |
 
 确认订单不占用谈判额度；`round` 只统计实际发出的挽留方案。
 
@@ -277,10 +290,10 @@ curl -s --noproxy '*' -X POST localhost:8777/api/accept \
 
 | 层 | 机制 | 位置 | 演示 |
 |---|---|---|---|
-| **L1** 收窄动作空间 | LLM 只能 function call `propose_copy(offer_id ∈ 白名单)`；**结构里没有金额字段**，「退 200%」在语法上不可表达 | `models.py` · `llm.TOOL` | — |
-| **L2** Schema + 策略校验 | Pydantic `extra=forbid` + 白名单断言 + `value ≤ 订单 30%` | `guardrails.validate_proposal` / `validate_value_cap` | `force:"bad_offer"` → 422 `OFFER_NOT_IN_ALLOWLIST` |
-| **L3** 出参文本扫描 | 正则扫金额/百分比/`keep the product`/`refund you`/`全额退款`，未批准一律拦 | `guardrails.scan_output_text` | `force:"bad_text"` → `FORBIDDEN_PHRASE`；`force:"bad_amount"` → `UNAPPROVED_AMOUNT` |
-| **L4** 执行层隔离 | 动钱只认 HMAC `offer_token`（TTL 15min + `jti` + 幂等键**内存与库双查**，重启后仍幂等），并**独立复核**上限 | `guardrails.issue_offer_token` / `verify_offer_token` · `app.accept` | 伪造 token → `BAD_SIGNATURE`；重放 → `already_executed` |
+| **L1&nbsp;收窄动作空间** | LLM 只能 function call `propose_copy(offer_id ∈ 白名单)`；**结构里没有金额字段**，「退 200%」在语法上不可表达 | `models.py` · `llm.TOOL` | — |
+| **L2&nbsp;Schema&nbsp;+&nbsp;策略校验** | Pydantic `extra=forbid` + 白名单断言 + `value ≤ 订单 30%` | `guardrails.validate_proposal` / `validate_value_cap` | `force:"bad_offer"` → 422 `OFFER_NOT_IN_ALLOWLIST` |
+| **L3&nbsp;出参文本扫描** | 正则扫金额/百分比/`keep the product`/`refund you`/`全额退款`，未批准一律拦 | `guardrails.scan_output_text` | `force:"bad_text"` → `FORBIDDEN_PHRASE`；`force:"bad_amount"` → `UNAPPROVED_AMOUNT` |
+| **L4&nbsp;执行层隔离** | 动钱只认 HMAC `offer_token`（TTL 15min + `jti` + 幂等键**内存与库双查**，重启后仍幂等），并**独立复核**上限 | `guardrails.issue_offer_token` / `verify_offer_token` · `app.accept` | 伪造 token → `BAD_SIGNATURE`；重放 → `already_executed` |
 
 L4 同时验证签名、TTL、唯一 `jti`、持久化幂等键，并回查订单独立复核金额上限。体验不变量由 `guardrails.assert_experience_invariants` 在每个响应返回前检查：
 
@@ -320,12 +333,12 @@ L4 同时验证签名、TTL、唯一 `jti`、持久化幂等键，并回查订�
 
 | 项 | 值 | 结果 |
 |---|---|---|
-| 自动化测试 | **177 / 177** | ✅ |
-| 真实链路场景 | **6 / 6**（状态与是否走真模型都对） | ✅ |
-| 真实链路护栏 | **3 / 3**（L2 + L3 × 2 全部 422） | ✅ |
+| 自动化&nbsp;测试 | **177 / 177** | ✅ |
+| 真实链路&nbsp;场景 | **6 / 6**（状态与是否走真模型都对） | ✅ |
+| 真实链路&nbsp;护栏 | **3 / 3**（L2 + L3 × 2 全部 422） | ✅ |
 | `experience_violations` | **0** | ✅ |
 | `avg_cost_per_conversation_usd` | **$0.001102**（case 预算 $0.15 的 0.7%） | ✅ |
-| Langfuse trace / score | 上报成功，`client_ready=true` | ✅ |
+| Langfuse&nbsp;trace&nbsp;/&nbsp;score | 上报成功，`client_ready=true` | ✅ |
 
 离线测试验证流程、策略、Admin API、持久化和护栏；模型话术质量、真实延迟与 Langfuse 上报由 `verify_live.py` 单独验证。
 
@@ -518,4 +531,4 @@ MVP 范围外，但都是上线前必须收掉的：
 
 ## 📄 许可
 
-本仓库是 case 的交付实现，未附开源许可证。引用或复用请注明出处。
+本项目采用 [MIT License](LICENSE) 开源许可。
