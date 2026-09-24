@@ -9,11 +9,7 @@
 [![Pydantic](https://img.shields.io/badge/Pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
 [![Langfuse](https://img.shields.io/badge/Langfuse-v4%20tracing-fbbf24.svg)](#-可观测)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-optional-336791.svg?logo=postgresql&logoColor=white)](#postgresql)
-<<<<<<< HEAD
-[![tests](https://img.shields.io/badge/e2e%20tests-36%2F36-brightgreen.svg)](#-验证)
-=======
 [![tests](https://img.shields.io/badge/tests-168%20passed-brightgreen.svg)](#-验证)
->>>>>>> feat/multitenant-config
 [![guardrails](https://img.shields.io/badge/护栏-4%20层%20L1→L4-brightgreen.svg)](#️-四层护栏)
 [![experience violations](https://img.shields.io/badge/体验不变量违反-0-brightgreen.svg)](#-体验不变量)
 [![cost](https://img.shields.io/badge/单次会话成本-0.7%25%20of%20budget-brightgreen.svg)](#-经济效率两级意图--三档生成路由)
