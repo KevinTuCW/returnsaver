@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Return Saver Admin</title>
+  <link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Shopify admin navigation">
+      <button class="store-switcher" type="button"><span class="store-avatar">A</span><strong>Acme Goods</strong><span class="nav-caret">⌄</span></button>
+      <nav class="shopify-nav" aria-label="Shopify admin">
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="home"></span>Home</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="orders"></span>Orders</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="products"></span>Products</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="customers"></span>Customers</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="content"></span>Content</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="analytics"></span>Analytics</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="marketing"></span>Marketing</a>
+        <a class="shopify-nav-item" href="#"><span class="font-icon" data-icon="discounts"></span>Discounts</a>
+      </nav>
+      <div class="nav-section-label">Sales channels</div>
+      <a class="shopify-nav-item" href="#"><span class="channel-dot"></span>Online Store</a>
+      <div class="nav-section-label">Apps</div>
+      <div class="app-navigation">
+        <div class="app-parent active"><span class="app-mark">R</span><strong>Return Saver</strong><span class="nav-caret">⌃</span></div>
+        <nav class="nav" aria-label="Return Saver">
+          <a class="nav-item" href="#dashboard" data-route="dashboard"><span class="font-icon subnav-icon" data-icon="dashboard"></span><span>Dashboard</span></a>
+          <a class="nav-item" href="#chats" data-route="chats"><span class="font-icon subnav-icon" data-icon="chats"></span><span>Chats</span></a>
+          <a class="nav-item" href="#policy" data-route="policy"><span class="font-icon subnav-icon" data-icon="policy"></span><span>Policy</span></a>
+        </nav>
+      </div>
+      <a class="shopify-nav-item settings-link" href="#"><span class="font-icon" data-icon="settings"></span>Settings</a>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <div class="app-identity"><span class="app-header-mark">R</span><span>Return Saver</span></div>
+          <h1 id="pageTitle">Dashboard</h1>
+        </div>
+        <div class="topbar-actions">
+          <button class="secondary" type="button" id="secondaryButton">Refresh</button>
+          <button class="primary" type="button" id="primaryButton">Export report</button>
+        </div>
+      </header>
+
+      <section id="routeContent" aria-live="polite"></section>
+    </main>
+  </div>
+  <script type="module" src="/admin/assets/app.js"></script>
+</body>
+</html>

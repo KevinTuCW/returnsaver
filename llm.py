@@ -197,6 +197,7 @@ GEN_SYS = """你是跨境 DTC 品牌的售后助理。目标：先解决用户�
 2. message 里绝对不能出现任何金额、百分比、"无需退回"、"全额退款"之类承诺——金额由系统渲染成卡片。
 3. 先共情再给方案，2-3 句，别推销。
 4. 必须调用 propose_copy 工具作答。
+5. 必须严格使用输入 ctx.language 指定的语言回复。
 """
 
 TOOL = {
@@ -292,6 +293,15 @@ def _meta(tier: ModelTier, model: str, ti: int, to: int) -> dict:
 def mock_copy(ctx: dict, offers: list[dict]) -> dict:
     """确定性兜底：无 key / 断网 / 模型异常时行为可预测，demo 永不翻车。"""
     name = ctx.get("customer_name", "你好")
+    if ctx.get("language") == "English":
+        opening = {
+            Scenario.USAGE_ISSUE.value: f"{name}, I'm sorry the setup has been frustrating.",
+            Scenario.VALUE_GAP.value: f"{name}, I'm sorry this didn't meet your expectations.",
+            Scenario.PRODUCT_DAMAGE.value: f"{name}, receiving a damaged item is not acceptable.",
+            Scenario.NOT_ELIGIBLE.value: f"{name}, I've reviewed the circumstances of this order.",
+        }.get(ctx.get("scenario"), f"{name}, I understand the issue.")
+        return {"offer_id": offers[0]["offer_id"] if offers else "",
+                "message": f"{opening} I can offer the option below. Would that work for you?"}
     opening = {
         Scenario.USAGE_ISSUE.value: f"{name}，这个多半是设置没走通，不是机器有问题。",
         Scenario.VALUE_GAP.value: f"{name}，没达到预期确实扫兴，这单我们没提示到位。",

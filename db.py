@@ -90,15 +90,19 @@ UPSERT_SESSION = """
 INSERT INTO sessions (session_id, customer_id, order_id, stage, round, turns,
                       intent, reason, emotion, scenario, llm_cost_usd,
                       model_calls, guardrail_trips, outcome,
-                      tenant_id, config_version, updated_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s, now())
+                      tenant_id, config_version, language, messages,
+                      last_activity_at, updated_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s::jsonb,
+        to_timestamp(%s), now())
 ON CONFLICT (session_id) DO UPDATE SET
     customer_id=EXCLUDED.customer_id, order_id=EXCLUDED.order_id,
     stage=EXCLUDED.stage, round=EXCLUDED.round, turns=EXCLUDED.turns,
     intent=EXCLUDED.intent, reason=EXCLUDED.reason, emotion=EXCLUDED.emotion,
     scenario=EXCLUDED.scenario, llm_cost_usd=EXCLUDED.llm_cost_usd,
     model_calls=EXCLUDED.model_calls, guardrail_trips=EXCLUDED.guardrail_trips,
-    outcome=EXCLUDED.outcome, updated_at=now()
+    outcome=EXCLUDED.outcome, language=EXCLUDED.language,
+    messages=EXCLUDED.messages, last_activity_at=EXCLUDED.last_activity_at,
+    updated_at=now()
     -- tenant_id / config_version 刻意不在 DO UPDATE 里：钉住就是钉住。
     -- 让它们跟着 UPSERT 漂移就等于把快照语义悄悄取消掉。
 """
@@ -112,7 +116,8 @@ def save_session(s) -> None:
         s.intent, s.reason, s.emotion, s.scenario, s.llm_cost_usd,
         json.dumps(s.model_calls, ensure_ascii=False),
         json.dumps(s.guardrail_trips, ensure_ascii=False), s.outcome,
-        s.tenant_id, s.config_version))
+        s.tenant_id, s.config_version, s.language,
+        json.dumps(s.messages, ensure_ascii=False), s.last_activity_at))
 
 
 def load_session(session_id: str) -> dict | None:
@@ -120,6 +125,15 @@ def load_session(session_id: str) -> dict | None:
         return None
     rows = _query("SELECT * FROM sessions WHERE session_id=%s", (session_id,))
     return rows[0] if rows else None
+
+
+def list_sessions(tenant_id: str | None = None, limit: int = 500) -> list[dict]:
+    if not enabled():
+        return []
+    if tenant_id:
+        return _query("SELECT * FROM sessions WHERE tenant_id=%s ORDER BY created_at DESC LIMIT %s",
+                      (tenant_id, limit))
+    return _query("SELECT * FROM sessions ORDER BY created_at DESC LIMIT %s", (limit,))
 
 
 # ──────────────────────────────────────────── 执行幂等

@@ -31,7 +31,9 @@ def cache_clear() -> None:
 # ──────────────────────────────────────────── 库层间接层（测试可 monkeypatch）
 def _enabled() -> bool:
     import db
-    return db.enabled()
+    # Dev may use Postgres only for durable conversations while keeping the
+    # built-in merchant policy and mock Shopify catalog.
+    return C.ENV != "dev" and db.enabled()
 
 
 def _fetch_config(tenant_id: str, version: int | None) -> dict | None:

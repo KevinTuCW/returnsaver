@@ -65,10 +65,17 @@ def build(principal, session) -> RetentionDeps:
         # 请求体里。key 若本身绑定到某个客户（"dji:Alice"），app 层会先校验它与
         # 会话主体一致，所以这里用会话的值是安全的。
         # 读 session.customer_id 而非提前取值：它在 _negotiate 里可能才被赋上。
-        get_order = lambda oid: db.fetch_order(                                   # noqa: E731
-            oid, tenant_id=t, customer_id=session.customer_id)
-        get_orders_of = lambda cid: db.fetch_orders_of(t, cid)                    # noqa: E731
-        get_customer = lambda cid: db.fetch_customer(t, cid)                      # noqa: E731
+        if C.ENV == "dev":
+            # Local demo persists conversations in Postgres without requiring a
+            # complete Shopify order mirror. Production never takes this branch.
+            get_order = lambda oid: store.ORDERS.get(oid)                         # noqa: E731
+            get_orders_of = lambda cid: store.orders_of(cid)                      # noqa: E731
+            get_customer = lambda cid: store.CUSTOMERS.get(cid)                   # noqa: E731
+        else:
+            get_order = lambda oid: db.fetch_order(                               # noqa: E731
+                oid, tenant_id=t, customer_id=session.customer_id)
+            get_orders_of = lambda cid: db.fetch_orders_of(t, cid)                # noqa: E731
+            get_customer = lambda cid: db.fetch_customer(t, cid)                  # noqa: E731
     else:
         # memory 模式：mock 语料。零配置演示与 hermetic 测试走这条
         get_order = lambda oid: store.ORDERS.get(oid)                             # noqa: E731
