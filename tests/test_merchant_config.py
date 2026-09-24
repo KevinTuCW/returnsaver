@@ -563,3 +563,96 @@ def test_rule_intent_reads_emotion_threshold_from_deps():
     res = llm.rule_intent("I am disappointed, I want to return", d)
     assert res is not None
     assert res.emotion < 0.60
+
+
+# ════════════════════════════════ 持久化（memory 模式下全部走降级）
+def test_load_falls_back_to_builtin_when_db_disabled():
+    """memory 模式：不连库，直接内置默认，且 degraded=False（这是正常状态，
+    不是故障——把它标成 degraded 会让 /health 长期亮红灯，真故障就淹没了）。"""
+    import merchant_store as MS
+    MS.cache_clear()
+    cfg, degraded = MS.load("public", version=None)
+    assert cfg is M.BUILTIN_DEFAULT
+    assert degraded is False
+
+
+def test_load_marks_degraded_when_db_configured_but_down(monkeypatch):
+    """库配了却连不上：用默认继续服务，但必须标 degraded 让 /health 说实话。"""
+    import merchant_store as MS
+    monkeypatch.setattr(MS, "_enabled", lambda: True)
+    monkeypatch.setattr(MS, "_fetch_config", lambda t, v: (_ for _ in ()).throw(
+        RuntimeError("connection refused")))
+    MS.cache_clear()
+    cfg, degraded = MS.load("public", version=None)
+    assert cfg is M.BUILTIN_DEFAULT
+    assert degraded is True
+
+
+def test_load_clamps_out_of_bounds_row(monkeypatch):
+    """手插的越界行被逐字段夹，其余字段保留。"""
+    import merchant_store as MS
+    row = M.BUILTIN_DEFAULT.as_fields()
+    row["max_discount_pct"] = 0.99      # 越界
+    row["manual_sla_hours"] = 6         # 合法，必须保留
+    row["version"] = 3
+    monkeypatch.setattr(MS, "_enabled", lambda: True)
+    monkeypatch.setattr(MS, "_fetch_config", lambda t, v: row)
+    MS.cache_clear()
+    cfg, degraded = MS.load("public", version=3)
+    assert cfg.max_discount_pct == 0.50
+    assert cfg.manual_sla_hours == 6
+    assert cfg.version == 3
+
+
+def test_immutable_version_is_cached(monkeypatch):
+    """(tenant, version) 不可变，所以只该查库一次。"""
+    import merchant_store as MS
+    calls = []
+
+    def fake(t, v):
+        calls.append((t, v))
+        return {**M.BUILTIN_DEFAULT.as_fields(), "version": 5}
+
+    monkeypatch.setattr(MS, "_enabled", lambda: True)
+    monkeypatch.setattr(MS, "_fetch_config", fake)
+    MS.cache_clear()
+    MS.load("public", version=5)
+    MS.load("public", version=5)
+    assert len(calls) == 1, calls
+
+
+def test_save_rejects_invalid_before_touching_db(monkeypatch):
+    """校验是写入主闸：越界配置连库都不该碰。"""
+    import merchant_store as MS
+    touched = []
+    monkeypatch.setattr(MS, "_enabled", lambda: True)
+    monkeypatch.setattr(MS, "_insert_config",
+                        lambda *a, **k: touched.append(1) or 1)
+    bad = M.BUILTIN_DEFAULT.as_fields()
+    bad["max_discount_pct"] = 0.99
+    with pytest.raises(ValueError) as e:
+        MS.save("public", bad, created_by="test")
+    assert "max_discount_pct" in str(e.value)
+    assert touched == [], "校验失败不该走到库层"
+
+
+def test_db_config_cols_match_merchant_config_fields():
+    """db.CONFIG_COLS 与 MerchantConfig 的可配置字段必须一一对应。
+
+    这两处是分开手写的：加一个阈值要同时改 merchant.py 的 dataclass、BOUNDS
+    和 db.CONFIG_COLS。漏掉任何一处的症状都是「配置存进去了但读不回来」，
+    而那是最难查的一类 bug——所以这里把漂移钉死在一个断言上。
+    """
+    import dataclasses
+
+    import db
+    import merchant as M
+
+    # MerchantConfig 里除了 rules/version（它们不是 rs_merchant_config 的列）
+    dataclass_fields = {f.name for f in dataclasses.fields(M.MerchantConfig)} - {
+        "rules", "version"}
+    assert set(db.CONFIG_COLS) == dataclass_fields, (
+        f"只在 db.CONFIG_COLS: {set(db.CONFIG_COLS) - dataclass_fields}; "
+        f"只在 MerchantConfig: {dataclass_fields - set(db.CONFIG_COLS)}")
+    # BOUNDS 覆盖除 exceptions_note 外的全部数值字段
+    assert set(M.BOUNDS) == dataclass_fields - {"exceptions_note"}

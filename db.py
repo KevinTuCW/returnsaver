@@ -161,6 +161,88 @@ def open_tickets() -> list[dict]:
                      ORDER BY due_at ASC""")
 
 
+# ──────────────────────────────────────────── 商家配置
+# 与 merchant.MerchantConfig 的字段一一对应。改这里必须同步改 merchant.py，
+# 所以顺序也保持一致，方便对照。
+CONFIG_COLS = ("return_window_days", "max_discount_pct", "instant_refund_cap_usd",
+               "manual_sla_hours", "emotion_hard_stop", "emotion_large_model",
+               "high_value_order_usd", "max_negotiation_rounds",
+               "max_session_turns", "abuse_negotiation_limit", "exceptions_note")
+
+# NUMERIC 从 psycopg 回来是 Decimal，下游一律按 float 用
+_FLOAT_COLS = ("max_discount_pct", "instant_refund_cap_usd", "high_value_order_usd")
+
+RULE_CODES = ("R-WINDOW", "R-FINAL", "R-HYGIENE", "R-USED", "R-DAMAGE")
+
+
+def fetch_merchant_config(tenant_id: str, version: int | None) -> dict | None:
+    """一行配置 + 它的 enabled 规则。version=None 取最新。
+
+    只取 enabled 的规则：merchant.check_eligibility 用「code 在不在 rules 里」
+    判断规则是否生效，停用的规则不该出现在这个 map 里。
+    """
+    if version is None:
+        rows = _query("""SELECT * FROM rs_merchant_config
+                         WHERE tenant_id=%s ORDER BY version DESC LIMIT 1""",
+                      (tenant_id,))
+    else:
+        rows = _query("""SELECT * FROM rs_merchant_config
+                         WHERE tenant_id=%s AND version=%s""",
+                      (tenant_id, version))
+    if not rows:
+        return None
+    row = dict(rows[0])
+    rules = _query("""SELECT code, text FROM rs_merchant_rule
+                      WHERE tenant_id=%s AND version=%s AND enabled=true""",
+                   (tenant_id, row["version"]))
+    out = {k: row[k] for k in CONFIG_COLS}
+    for k in _FLOAT_COLS:
+        out[k] = float(out[k])
+    out["version"] = int(row["version"])
+    out["rules"] = {r["code"]: r["text"] for r in rules}
+    out["disabled_rules"] = [c for c in RULE_CODES if c not in out["rules"]]
+    return out
+
+
+def fetch_tenant(tenant_id: str) -> dict | None:
+    rows = _query("SELECT * FROM rs_tenant WHERE tenant_id=%s", (tenant_id,))
+    return dict(rows[0]) if rows else None
+
+
+def insert_merchant_config(tenant_id: str, fields: dict, *, created_by: str,
+                           note: str | None) -> int:
+    """append-only 插入 version+1，规则一起写。返回新版本号。
+
+    版本号在**同一个事务里**算：两个并发写各自先 SELECT MAX 再 INSERT 会拿到
+    同一个 version 撞主键，其中一个直接失败。
+    """
+    pool = _get_pool()
+    if pool is None:
+        raise RuntimeError("database unavailable")
+    with pool.connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM rs_merchant_config "
+                "WHERE tenant_id=%s", (tenant_id,))
+            version = int(cur.fetchone()[0])
+            conn.execute(
+                f"""INSERT INTO rs_merchant_config
+                    (tenant_id, version, {', '.join(CONFIG_COLS)},
+                     created_by, note)
+                    VALUES (%s, %s, {', '.join(['%s'] * len(CONFIG_COLS))},
+                            %s, %s)""",
+                (tenant_id, version, *[fields[c] for c in CONFIG_COLS],
+                 created_by, note))
+            disabled = set(fields.get("disabled_rules") or [])
+            for code, text in (fields.get("rules") or {}).items():
+                conn.execute(
+                    """INSERT INTO rs_merchant_rule
+                       (tenant_id, version, code, text, enabled)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (tenant_id, version, code, text, code not in disabled))
+    return version
+
+
 def close() -> None:
     global _pool
     if _pool is not None:
