@@ -12,8 +12,8 @@ import uuid
 from pydantic import ValidationError
 
 import config as C
+from deps import RetentionDeps
 from models import Action, CopyProposal
-from store import ORDERS
 
 
 class GuardrailTripped(Exception):
@@ -36,12 +36,13 @@ def validate_proposal(raw: dict, allowed_ids: set[str]) -> CopyProposal:
     return p
 
 
-def validate_value_cap(offer: dict, order: dict) -> None:
-    cap = round(order["total"] * C.MAX_DISCOUNT_PCT, 2)
+def validate_value_cap(offer: dict, order: dict, deps: RetentionDeps) -> None:
+    pct = deps.config.max_discount_pct
+    cap = round(order["total"] * pct, 2)
     if offer["value"] > cap:
         raise GuardrailTripped("L2", "VALUE_OVER_CAP",
-                               f"{offer['value']} > 上限 {cap}（订单 {order['total']} 的 "
-                               f"{int(C.MAX_DISCOUNT_PCT*100)}%）")
+                               f"{offer['value']} > 上限 {cap}（订单 "
+                               f"{order['total']} 的 {int(pct * 100)}%）")
 
 
 # ════════════════════════════════════════════ L3 出参文本扫描
@@ -64,16 +65,28 @@ def scan_output_text(text: str, approved_values: set[str]) -> None:
 
 
 # ════════════════════════════════════════════ L4 执行层隔离
-def issue_offer_token(order_id: str, offer: dict) -> str:
+def issue_offer_token(order_id: str, offer: dict, deps: RetentionDeps) -> str:
+    """签发兑付凭证。cfg_v 让 L4 能按**签发时那一版**复核上限。
+
+    没有 cfg_v 的话：商家在 TTL 内把上限从 30% 调到 10%，L4 会否掉系统自己
+    承诺给客户的方案——直接踩「符合规则的退货绝不加阻力」这条体验红线。
+    """
     payload = {"order_id": order_id, "offer_id": offer["offer_id"],
-               "value": float(offer["value"]), "exp": int(time.time()) + C.OFFER_TOKEN_TTL,
+               "value": float(offer["value"]),
+               "cfg_v": int(deps.config_version),
+               "exp": int(time.time()) + C.OFFER_TOKEN_TTL,
                "jti": uuid.uuid4().hex}
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     sig = hmac.new(C.SIGNING_KEY, raw, hashlib.sha256).hexdigest()[:32]
     return f"{raw.hex()}.{sig}"
 
 
-def verify_offer_token(token: str) -> dict:
+def verify_offer_token(token: str, *, get_order, load_config) -> dict:
+    """L4 独立复核。签名只证明「这是我们签的」，不证明「金额当时算对了」。
+
+    `load_config(version)` 由调用方注入：Task 11 会传能按版本回查的实现，
+    memory 模式下传的是"永远返回内置默认"。
+    """
     try:
         raw_hex, sig = token.split(".", 1)
         raw = bytes.fromhex(raw_hex)
@@ -85,11 +98,11 @@ def verify_offer_token(token: str) -> dict:
     payload = json.loads(raw)
     if payload["exp"] < time.time():
         raise GuardrailTripped("L4", "TOKEN_EXPIRED", "offer 已过期，请重新发起")
-    # 独立复核：不信任上游，自己按策略再算一遍上限
-    order = ORDERS.get(payload["order_id"])
+    order = get_order(payload["order_id"])
     if not order:
         raise GuardrailTripped("L4", "ORDER_NOT_FOUND", "执行层找不到订单")
-    if payload["value"] > round(order["total"] * C.MAX_DISCOUNT_PCT, 2):
+    cfg = load_config(int(payload.get("cfg_v", 0)))
+    if payload["value"] > round(order["total"] * cfg.max_discount_pct, 2):
         raise GuardrailTripped("L4", "VALUE_OVER_CAP", "执行层复核：金额超过硬上限")
     return payload
 

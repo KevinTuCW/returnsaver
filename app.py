@@ -17,6 +17,7 @@ import config as C
 import db
 import guardrails as G
 import llm
+import merchant as M
 import metrics
 import observability as obs
 import policy
@@ -251,13 +252,13 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # 模板档：不过 LLM，直接渲染确定性文案
     if tier is ModelTier.NONE and not req.force:
         return _template_reply(session, order, scenario, action, offers,
-                               res["payload"], allow_retention)
+                               res["payload"], deps, allow_retention)
 
     # ── L2 / L3 护栏
     try:
         proposal = G.validate_proposal(raw, allowed_ids)
         offer = next(o for o in offers if o["offer_id"] == proposal.offer_id)
-        G.validate_value_cap(offer, order)
+        G.validate_value_cap(offer, order, deps)
         G.scan_output_text(proposal.message, approved)
     except G.GuardrailTripped as e:
         return _blocked(session, e)
@@ -269,7 +270,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         "status": "offer_made", "scenario": scenario.value, "action": action.value,
         "reply": proposal.message,
         "offer": {**offer},
-        "offer_token": G.issue_offer_token(order_id, offer),
+        "offer_token": G.issue_offer_token(order_id, offer, deps),
         "alternatives": [{"offer_id": o["offer_id"], "label": o["label"]}
                          for o in offers if o["offer_id"] != offer["offer_id"]],
         "next_action": "await_customer_decision",
@@ -282,7 +283,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
 # ════════════════════════════════════════════ 确定性模板分支（零 LLM 成本）
 def _template_reply(session: store.Session, order: dict, scenario: Scenario,
                     action: Action, offers: list[dict], pl: dict,
-                    allow_retention: bool = True) -> dict:
+                    deps: D.RetentionDeps, allow_retention: bool = True) -> dict:
     metrics.record_conversation(session.session_id, scenario.value, action.value,
                                 session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
@@ -295,7 +296,7 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
              "reply": reply, "cited_rules": cited, "policy_note": pl["policy_note"],
              "offer": alt, "next_action": "await_customer_decision"}
         if alt:
-            p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+            p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
         return _ok(session, p, allow_retention)
 
     alt = offers[0] if offers else None
@@ -303,7 +304,7 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
          "reply": "我先给你一个方案，你看合不合适。", "offer": alt,
          "next_action": "await_customer_decision"}
     if alt:
-        p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+        p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
     return _ok(session, p, allow_retention)
 
 
@@ -369,7 +370,10 @@ def accept(req: AcceptRequest):
         store.EXECUTED[req.idempotency_key] = result      # 回填，后续重放不再查库
         return {"status": "already_executed", **result}
     try:
-        payload = G.verify_offer_token(req.offer_token)
+        payload = G.verify_offer_token(
+            req.offer_token,
+            get_order=lambda oid: store.ORDERS.get(oid),
+            load_config=lambda v: M.BUILTIN_DEFAULT)   # Task 11 换成按版本回查
     except G.GuardrailTripped as e:
         metrics.record_guardrail(e.layer, e.code)
         print(f"GUARDRAIL_TRIGGERED layer={e.layer} code={e.code} detail={e.detail}")
