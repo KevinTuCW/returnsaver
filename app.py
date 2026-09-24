@@ -424,6 +424,19 @@ def health():
     cfg["llm_mode"] = "real" if C.USE_REAL_LLM else "mock"
     cfg["langfuse"]["client_ready"] = obs.enabled()
     cfg["store"] = db.ping()
+
+    # 配置来源必须可见：跑「库里的配置」和跑「内置默认」行为不同，
+    # 静默用默认是最难查的一类故障——看一眼就知道比翻日志强。
+    tenant = C.DEFAULT_TENANT
+    snapshot, degraded = MS.load(tenant, None)
+    cfg["config"] = {
+        "source": "database" if (db.enabled() and snapshot.version) else "builtin",
+        "degraded": degraded,
+        "tenant": tenant,
+        "version": snapshot.version,
+    }
+    if degraded:
+        cfg["ok"] = False
     return cfg
 
 

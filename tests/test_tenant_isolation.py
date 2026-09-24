@@ -95,3 +95,27 @@ def test_session_records_tenant_and_pinned_version(monkeypatch):
     s = store.get_session(r.json()["session_id"])
     assert s.tenant_id == C.DEFAULT_TENANT
     assert s.config_version == 0          # memory 模式钉 0 = 内置默认
+
+
+def test_health_reports_config_source(monkeypatch):
+    """跑库里的配置还是内置默认，运维得看得见。"""
+    _keys(monkeypatch, {})
+    h = client.get("/health").json()
+    assert h["config"]["source"] in ("builtin", "database")
+    assert h["config"]["degraded"] is False
+    assert h["config"]["tenant"] == C.DEFAULT_TENANT
+    assert "auth" in h and h["auth"]["key_count"] == 0
+
+
+def test_health_goes_not_ok_when_config_degraded(monkeypatch):
+    """库配了却连不上：用默认继续服务，但 ok=false，别假装一切正常。"""
+    import merchant_store as MS
+    _keys(monkeypatch, {})
+    monkeypatch.setattr(MS, "_enabled", lambda: True)
+    monkeypatch.setattr(MS, "_fetch_config", lambda t, v: (_ for _ in ()).throw(
+        RuntimeError("connection refused")))
+    MS.cache_clear()
+    h = client.get("/health").json()
+    assert h["config"]["degraded"] is True
+    assert h["ok"] is False
+    MS.cache_clear()
