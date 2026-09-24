@@ -28,6 +28,7 @@ PORT = _i("RS_PORT", 8777)
 SIGNING_KEY = os.getenv("RS_SIGNING_KEY", "dev-only-not-a-real-secret").encode()
 if ENV == "prod" and SIGNING_KEY == b"dev-only-not-a-real-secret":
     raise RuntimeError("生产环境必须设置 RS_SIGNING_KEY（openssl rand -hex 32）")
+DEFAULT_TENANT = os.getenv("RS_DEFAULT_TENANT", "public")
 
 # ──────────────────────────────────────────── LLM 接入（OpenAI 兼容端点，默认智谱 GLM）
 LLM_BASE_URL = (os.getenv("RS_LLM_BASE_URL") or os.getenv("GLM_BASE_URL")

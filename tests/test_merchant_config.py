@@ -447,3 +447,22 @@ def test_clamp_output_always_validates(overrides):
 # ── Fix I 的推理由这两个已有测试覆盖，见 test_boundary_values_are_accepted
 #    （闭区间两端）与 test_clamp_emotion_repair_preserves_stricter_hard_stop
 #    （单边修复不越界）；这里不再重复。
+
+
+# ════════════════════════════════ RetentionDeps
+def test_deps_defaults_to_builtin_config():
+    import deps as D
+    d = D.build_default()
+    assert d.config is M.BUILTIN_DEFAULT
+    assert d.config_version == 0
+    assert d.tenant_id == "public"
+    assert d.cost_budget_usd == 0.05      # 与今天的 RS_COST_BUDGET 默认一致
+
+
+def test_deps_is_immutable():
+    """快照被下游改掉就不是快照了。"""
+    import dataclasses
+    import deps as D
+    d = D.build_default()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        d.config_version = 9
