@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 import config as C
 import db
+import deps as D
 import guardrails as G
 import llm
 import merchant as M
@@ -112,8 +113,9 @@ def negotiate(req: NegotiateRequest):
     会话必须在打开 trace **之前**解析出来——否则首轮的 trace 会挂到 "new" 上，
     Langfuse 里就聚合不成一段完整对话。"""
     session = store.get_session(req.session_id) or store.new_session(req.customer_id)
+    deps = D.build_default()          # Task 10 换成按租户构造并钉住版本
     with obs.session_trace(session.session_id, req.customer_id, req.message) as span:
-        out = _negotiate(req, session)
+        out = _negotiate(req, session, deps)
         if span is not None and not isinstance(out, JSONResponse):
             obs.update(span, output={"status": out.get("status"),
                                      "scenario": out.get("scenario"),
@@ -123,10 +125,8 @@ def negotiate(req: NegotiateRequest):
         return out
 
 
-def _negotiate(req: NegotiateRequest, session: store.Session):
-    import deps as D
-    deps = D.build_default()      # Task 6 会换成按租户构造
-
+def _negotiate(req: NegotiateRequest, session: store.Session,
+               deps: D.RetentionDeps):
     if req.customer_id:
         session.customer_id = req.customer_id
     session.turns += 1
@@ -136,9 +136,9 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         return _release(session, "没问题，已经为你开启退货流程，物流单马上发到邮箱。",
                         "user_opted_out")
     # round 只统计"真正发出过的挽留轮次"——确认订单、澄清身份都不占额度
-    if session.round >= C.MAX_NEGOTIATION_ROUNDS:
+    if session.round >= deps.config.max_negotiation_rounds:
         return _release(session, "不耽误你了，退货流程已经开好。", "max_rounds_reached")
-    if session.turns > C.MAX_SESSION_TURNS:
+    if session.turns > deps.config.max_session_turns:
         return _release(session, "这单我直接给你走退货，不再占用你时间。", "max_turns_reached")
 
     # ── S1 意图识别（规则快路 → 小模型，永不用大模型）
