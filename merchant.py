@@ -6,10 +6,16 @@
 护栏原本是用来防模型的。max_discount_pct=1.0 会让 L2/L4 的上限检查变成空操作，
 emotion_hard_stop=1.0 会关掉「发火用户不再挽留」。商家能调的只是「多宽松」，
 不是「要不要有护栏」。
+
+clamp() 是读取层，跑在生产环境里处理不可信的数据库行——它绝不能抛异常，也绝不能
+在修复冲突时滑向更宽松的一端（那等于让脏数据帮商家把护栏调松）。
 """
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 # 破损与质量豁免是消费者保护底线，不是商家可选项
@@ -34,6 +40,23 @@ BOUNDS: dict[str, tuple[float, float]] = {
 INT_FIELDS = ("return_window_days", "manual_sla_hours", "max_negotiation_rounds",
               "max_session_turns", "abuse_negotiation_limit")
 
+EMOTION_GAP = 0.01   # large_model 必须严格小于 hard_stop，留一个最小间隔
+
+
+def _coerce(raw: Any) -> float | None:
+    """数值强制转换。失败或非有限值返回 None。
+
+    validate 与 clamp 共用这一个入口：两者对「什么算合法数字」的判断必须一致，
+    各写各的迟早漂移。OverflowError 不是 ValueError 的子类，必须显式捕获——
+    一个 400 位的整数曾能穿过 validate 直接抛到请求里。NaN 会让
+    `max(lo, min(hi, nan))` 退化成 hi，即静默选中区间最宽松的一端，所以也要挡。
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) else None
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -55,8 +78,14 @@ class MerchantConfig:
     max_session_turns: int
     abuse_negotiation_limit: int
     exceptions_note: str
-    rules: dict[str, str] = field(default_factory=dict)   # 只含 enabled 的规则
-    version: int = 0                                      # 0 = 内置默认
+    rules: Mapping[str, str] = field(default_factory=dict)   # 只含 enabled 的规则
+    version: int = 0                                         # 0 = 内置默认
+
+    def __post_init__(self) -> None:
+        # frozen dataclass 不能直接赋值，只能用 object.__setattr__。目的是让
+        # rules 真正不可变——降级路径全局共享 BUILTIN_DEFAULT.rules，一次原地
+        # 赋值（BUILTIN_DEFAULT.rules["R-DAMAGE"] = ...）就会污染所有后续读取。
+        object.__setattr__(self, "rules", MappingProxyType(dict(self.rules)))
 
     def as_fields(self) -> dict[str, Any]:
         """摊平成 validate/clamp 吃的 dict。"""
@@ -98,26 +127,39 @@ def validate(fields: dict[str, Any]) -> list[Violation]:
         if name not in fields:
             out.append(Violation(name, "缺少该字段"))
             continue
-        try:
-            v = float(fields[name])
-        except (TypeError, ValueError):
-            out.append(Violation(name, f"不是数字：{fields[name]!r}"))
+        v = _coerce(fields[name])
+        if v is None:
+            out.append(Violation(name, f"不是有限数字：{fields[name]!r}"))
             continue
         if not (lo <= v <= hi):
             out.append(Violation(name, f"{v} 超出区间 [{lo}, {hi}]"))
+        elif name in INT_FIELDS and v != int(v):
+            out.append(Violation(name, f"必须是整数：{v}"))
 
-    # 跨字段：相等或反过来会让「升大模型」永远命中不到
-    try:
-        if float(fields["emotion_large_model"]) >= float(fields["emotion_hard_stop"]):
-            out.append(Violation(
-                "emotion_large_model",
-                "必须严格小于 emotion_hard_stop，否则升档分支成为死代码"))
-    except (KeyError, TypeError, ValueError):
-        pass
+    # 跨字段：相等或反过来会让「升大模型」永远命中不到。
+    # 缺失/非数字已由上面的 bounds 循环报过，这里只防重复上报。
+    lm = _coerce(fields.get("emotion_large_model"))
+    hs = _coerce(fields.get("emotion_hard_stop"))
+    if lm is not None and hs is not None and lm >= hs:
+        out.append(Violation(
+            "emotion_large_model",
+            "必须严格小于 emotion_hard_stop，否则升档分支成为死代码"))
 
     for code in fields.get("disabled_rules", []) or []:
         if code in IMMUTABLE_RULES:
             out.append(Violation(code, "该规则不可停用（消费者保护底线）"))
+
+    # 规则原文会在婉拒时展示给客户（config.EXPERIENCE_INVARIANTS 的
+    # decline_must_cite_rule）：空文案等于什么都没引用，未知代码没有对应文案。
+    raw_rules = fields.get("rules")
+    if isinstance(raw_rules, dict):
+        for code, body in raw_rules.items():
+            if code not in RULE_CODES:
+                out.append(Violation(code, "未知规则代码"))
+            elif not str(body).strip():
+                out.append(Violation(code, "规则内容不能为空——婉拒时要展示给客户"))
+    elif raw_rules is not None:
+        out.append(Violation("rules", f"不是合法的规则字典：{raw_rules!r}"))
 
     if not str(fields.get("exceptions_note", "")).strip():
         out.append(Violation("exceptions_note", "不能为空——婉拒时要展示给客户"))
@@ -130,28 +172,36 @@ def clamp(fields: dict[str, Any]) -> MerchantConfig:
 
     有人绕过 API 直接 psql 插了越界值时走这条路。一个字段填错不该让商家丢掉
     其余所有设置，所以这里是 per-field clamp 而不是 wholesale fallback。
+    对任何非有限数字（非数字类型、NaN、超出 float 表示范围的大整数……）一律
+    回退到该字段的内置默认值，绝不抛异常——这一层就是给脏数据兜底的。
     """
     vals: dict[str, Any] = {}
     for name, (lo, hi) in BOUNDS.items():
         raw = fields.get(name, getattr(BUILTIN_DEFAULT, name))
-        try:
-            v = float(raw)
-        except (TypeError, ValueError):
+        v = _coerce(raw)
+        if v is None:
             v = float(getattr(BUILTIN_DEFAULT, name))
         v = max(lo, min(hi, v))
         vals[name] = int(v) if name in INT_FIELDS else v
 
-    # 夹完还可能违反跨字段约束（如两者都被夹到 0.80/0.90 之外的组合）
+    # 单边修复：保留 hard_stop（它是安全规则，低=严），只把 large_model 压到它
+    # 下面。绝不反过来抬高 hard_stop——那是朝不安全方向改一个商家设对了的护栏。
+    # BOUNDS 保证这总是可行：large_model 下界 0.20 < hard_stop 下界 0.50。
     if vals["emotion_large_model"] >= vals["emotion_hard_stop"]:
-        vals["emotion_large_model"] = BUILTIN_DEFAULT.emotion_large_model
-        vals["emotion_hard_stop"] = BUILTIN_DEFAULT.emotion_hard_stop
+        lo, _ = BOUNDS["emotion_large_model"]
+        vals["emotion_large_model"] = max(lo, vals["emotion_hard_stop"] - EMOTION_GAP)
 
-    rules = dict(fields.get("rules") or BUILTIN_DEFAULT.rules)
+    raw_rules = fields.get("rules")
+    rules = dict(raw_rules) if isinstance(raw_rules, Mapping) else dict(BUILTIN_DEFAULT.rules)
     for code in IMMUTABLE_RULES:                      # 强制在场
         rules.setdefault(code, BUILTIN_DEFAULT.rules[code])
 
     note = str(fields.get("exceptions_note", "")).strip() \
         or BUILTIN_DEFAULT.exceptions_note
 
-    return MerchantConfig(**vals, exceptions_note=note, rules=rules,
-                          version=int(fields.get("version", 0)))
+    try:
+        version = int(fields.get("version", 0))
+    except (TypeError, ValueError):
+        version = 0
+
+    return MerchantConfig(**vals, exceptions_note=note, rules=rules, version=version)
