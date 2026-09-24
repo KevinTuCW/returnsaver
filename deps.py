@@ -45,3 +45,27 @@ def build_default() -> RetentionDeps:
         get_customer=lambda cid: store.CUSTOMERS.get(cid),
         degraded=False,
     )
+
+
+def build(principal, session) -> RetentionDeps:
+    """按租户构造，配置版本取自会话。
+
+    版本从 **session** 取而不是取租户当前版本——这就是快照语义的落点：商家
+    中途发了新版本，进行中的会话仍按它开始时钉住的那一版结算。
+    """
+    import merchant_store as MS
+    import store
+
+    cfg, degraded = MS.load(principal.tenant_id, session.config_version)
+    return RetentionDeps(
+        config=cfg,
+        config_version=cfg.version,
+        tenant_id=principal.tenant_id,
+        # 成本预算读实时值、不进快照：没有任何 offer_token 依赖它，
+        # 为它加一套不可变机制是纯开销
+        cost_budget_usd=MS.cost_budget(principal.tenant_id),
+        get_order=lambda oid: store.ORDERS.get(oid),
+        get_orders_of=lambda cid: store.orders_of(cid),
+        get_customer=lambda cid: store.CUSTOMERS.get(cid),
+        degraded=degraded,
+    )

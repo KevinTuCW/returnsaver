@@ -143,6 +143,10 @@ KNOWLEDGE_BASE = {
 class Session:
     session_id: str
     customer_id: str | None = None
+    tenant_id: str = "public"
+    # 会话开始时钉住的配置版本，0 = 内置默认。钉住了就不再变：商家中途改配置
+    # 不该让同一段对话前后两轮按不同规则结算。
+    config_version: int = 0
     order_id: str | None = None
     stage: Stage = Stage.INTENT
     round: int = 0      # 已发出的挽留轮次
@@ -164,8 +168,10 @@ EXECUTED: dict[str, dict] = {}        # 幂等表
 MANUAL_QUEUE: list[dict] = []         # 人工介入工单
 
 
-def new_session(customer_id: str | None) -> Session:
-    s = Session(session_id=f"S-{uuid.uuid4().hex[:12]}", customer_id=customer_id)
+def new_session(customer_id: str | None, tenant_id: str = "public",
+                config_version: int = 0) -> Session:
+    s = Session(session_id=f"S-{uuid.uuid4().hex[:12]}", customer_id=customer_id,
+                tenant_id=tenant_id, config_version=config_version)
     SESSIONS[s.session_id] = s
     return s
 

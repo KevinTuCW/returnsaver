@@ -10,15 +10,17 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from auth import Principal, require_principal
 import config as C
 import db
 import deps as D
 import guardrails as G
 import llm
 import merchant as M
+import merchant_store as MS
 import metrics
 import observability as obs
 import policy
@@ -107,13 +109,24 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
 
 # ════════════════════════════════════════════ 主入口
 @app.post("/api/negotiate")
-def negotiate(req: NegotiateRequest):
+def negotiate(req: NegotiateRequest,
+              principal: Principal = Depends(require_principal)):
     """一次调用 = 一个 Langfuse span，session_id 把整段对话串起来。
 
     会话必须在打开 trace **之前**解析出来——否则首轮的 trace 会挂到 "new" 上，
     Langfuse 里就聚合不成一段完整对话。"""
-    session = store.get_session(req.session_id) or store.new_session(req.customer_id)
-    deps = D.build_default()          # Task 10 换成按租户构造并钉住版本
+    session = store.get_session(req.session_id)
+    if session is None:
+        # 新会话：钉住该租户当前版本。这是快照语义的锚点。
+        session = store.new_session(
+            req.customer_id, tenant_id=principal.tenant_id,
+            config_version=MS.current_version(principal.tenant_id))
+    elif session.tenant_id != principal.tenant_id:
+        # 会话是租户级资源。拿 B 租户的 key 续 A 租户的会话就是横向越权，
+        # 与 helpmate 在 002_order_ownership 里学到的是同一课，换个对象重演。
+        raise HTTPException(status_code=403,
+                            detail="session belongs to another tenant")
+    deps = D.build(principal, session)
     with obs.session_trace(session.session_id, req.customer_id, req.message) as span:
         out = _negotiate(req, session, deps)
         if span is not None and not isinstance(out, JSONResponse):

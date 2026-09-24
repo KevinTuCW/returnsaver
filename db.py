@@ -89,8 +89,9 @@ def _query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
 UPSERT_SESSION = """
 INSERT INTO sessions (session_id, customer_id, order_id, stage, round, turns,
                       intent, reason, emotion, scenario, llm_cost_usd,
-                      model_calls, guardrail_trips, outcome, updated_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s, now())
+                      model_calls, guardrail_trips, outcome,
+                      tenant_id, config_version, updated_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s, now())
 ON CONFLICT (session_id) DO UPDATE SET
     customer_id=EXCLUDED.customer_id, order_id=EXCLUDED.order_id,
     stage=EXCLUDED.stage, round=EXCLUDED.round, turns=EXCLUDED.turns,
@@ -98,6 +99,8 @@ ON CONFLICT (session_id) DO UPDATE SET
     scenario=EXCLUDED.scenario, llm_cost_usd=EXCLUDED.llm_cost_usd,
     model_calls=EXCLUDED.model_calls, guardrail_trips=EXCLUDED.guardrail_trips,
     outcome=EXCLUDED.outcome, updated_at=now()
+    -- tenant_id / config_version 刻意不在 DO UPDATE 里：钉住就是钉住。
+    -- 让它们跟着 UPSERT 漂移就等于把快照语义悄悄取消掉。
 """
 
 
@@ -108,7 +111,8 @@ def save_session(s) -> None:
         s.session_id, s.customer_id, s.order_id, s.stage.value, s.round, s.turns,
         s.intent, s.reason, s.emotion, s.scenario, s.llm_cost_usd,
         json.dumps(s.model_calls, ensure_ascii=False),
-        json.dumps(s.guardrail_trips, ensure_ascii=False), s.outcome))
+        json.dumps(s.guardrail_trips, ensure_ascii=False), s.outcome,
+        s.tenant_id, s.config_version))
 
 
 def load_session(session_id: str) -> dict | None:
