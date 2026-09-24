@@ -152,14 +152,14 @@ def validate(fields: dict[str, Any]) -> list[Violation]:
     # 规则原文会在婉拒时展示给客户（config.EXPERIENCE_INVARIANTS 的
     # decline_must_cite_rule）：空文案等于什么都没引用，未知代码没有对应文案。
     raw_rules = fields.get("rules")
-    if isinstance(raw_rules, dict):
+    if isinstance(raw_rules, Mapping):
         for code, body in raw_rules.items():
             if code not in RULE_CODES:
                 out.append(Violation(code, "未知规则代码"))
             elif not str(body).strip():
                 out.append(Violation(code, "规则内容不能为空——婉拒时要展示给客户"))
     elif raw_rules is not None:
-        out.append(Violation("rules", f"不是合法的规则字典：{raw_rules!r}"))
+        out.append(Violation("rules", f"不是合法的规则映射：{raw_rules!r}"))
 
     if not str(fields.get("exceptions_note", "")).strip():
         out.append(Violation("exceptions_note", "不能为空——婉拒时要展示给客户"))

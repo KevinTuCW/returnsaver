@@ -168,6 +168,14 @@ def test_validate_rejects_blank_rule_body():
     assert any(v.field == "R-WINDOW" for v in violations)
 
 
+def test_validate_accepts_mapping_proxy_rules():
+    """MerchantConfig.rules 本身就是 MappingProxyType（Fix 8）；load-modify-save
+    时把它原样传回 validate 不该因为容器类型不是 dict 而被误拒。"""
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = M.BUILTIN_DEFAULT.rules
+    assert M.validate(fields) == []
+
+
 def test_validate_rejects_unknown_rule_code():
     fields = M.BUILTIN_DEFAULT.as_fields()
     fields["rules"] = dict(fields["rules"])
