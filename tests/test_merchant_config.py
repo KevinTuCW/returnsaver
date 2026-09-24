@@ -466,3 +466,58 @@ def test_deps_is_immutable():
     d = D.build_default()
     with pytest.raises(dataclasses.FrozenInstanceError):
         d.config_version = 9
+
+
+# ════════════════════════════════ policy 读 deps 而非模块常量
+def test_policy_reads_discount_cap_from_deps():
+    """把上限调到 10%，让利必须跟着降——证明它读的是 deps 不是 C。"""
+    import dataclasses
+    import deps as D
+    import policy
+    from models import Scenario
+
+    tight = dataclasses.replace(M.BUILTIN_DEFAULT, max_discount_pct=0.10)
+    d = dataclasses.replace(D.build_default(), config=tight)
+
+    order = {"order_id": "O-1", "total": 100.0, "category": "apparel",
+             "sku": "X", "sizes_in_stock": [], "repairable": False,
+             "negotiations_last_90d": 0, "days_since_delivery": 5,
+             "final_sale": False, "opened": False, "used": False}
+    customer = {"name": "T", "tier": "normal", "risk_flag": False,
+                "returns_last_90d": 0}
+    res = policy.build_resolution(order, customer, Scenario.VALUE_GAP,
+                                  {"eligible": True, "violated": []}, 1, d)
+    assert all(o["value"] <= 10.0 for o in res["offers"]), res["offers"]
+
+
+def test_policy_reads_emotion_threshold_from_deps():
+    import dataclasses
+    import deps as D
+    import policy
+    from models import ReturnReason, Scenario
+
+    calm = dataclasses.replace(M.BUILTIN_DEFAULT, emotion_hard_stop=0.90)
+    d = dataclasses.replace(D.build_default(), config=calm)
+    order = {"days_since_delivery": 5, "final_sale": False, "opened": False,
+             "used": False, "category": "home"}
+    # 0.85 在默认 0.70 下会判成 EMOTIONAL_INSIST，在 0.90 下不会
+    got = policy.classify_scenario(order, ReturnReason.SIZE_FIT, 0.85,
+                                   {"eligible": True, "violated": []}, d)
+    assert got is not Scenario.EMOTIONAL_INSIST
+
+
+def test_disabled_rule_stops_blocking():
+    """停用 R-FINAL 后，final sale 不再拦人。"""
+    import dataclasses
+    import deps as D
+    import policy
+    from models import ReturnReason
+
+    rules = {k: v for k, v in M.BUILTIN_DEFAULT.rules.items() if k != "R-FINAL"}
+    cfg = dataclasses.replace(M.BUILTIN_DEFAULT, rules=rules)
+    d = dataclasses.replace(D.build_default(), config=cfg)
+
+    order = {"days_since_delivery": 5, "final_sale": True, "opened": False,
+             "used": False, "category": "home"}
+    elig = policy.check_eligibility(order, ReturnReason.CHANGED_MIND, d)
+    assert elig["eligible"], elig

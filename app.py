@@ -123,6 +123,9 @@ def negotiate(req: NegotiateRequest):
 
 
 def _negotiate(req: NegotiateRequest, session: store.Session):
+    import deps as D
+    deps = D.build_default()      # Task 6 会换成按租户构造
+
     if req.customer_id:
         session.customer_id = req.customer_id
     session.turns += 1
@@ -204,20 +207,20 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # ── S4 售后规则核验
     session.stage = Stage.ELIGIBILITY
     reason = ReturnReason(session.reason)
-    elig = policy.check_eligibility(order, reason)
+    elig = policy.check_eligibility(order, reason, deps)
 
     # ── S5 场景分类 + 执行策略
     session.stage = Stage.EXECUTE
-    scenario = policy.classify_scenario(order, reason, session.emotion, elig)
+    scenario = policy.classify_scenario(order, reason, session.emotion, elig, deps)
     session.scenario = scenario.value
 
     # 情绪激烈场景：不生成任何挽留话术，直接分级执行（不消耗谈判额度）
     if scenario is Scenario.EMOTIONAL_INSIST:
-        res = policy.build_resolution(order, customer, scenario, elig, session.round)
+        res = policy.build_resolution(order, customer, scenario, elig, session.round, deps)
         return _emotional(session, order, res["action"], res["payload"])
 
     # 先按"假如这是下一轮"算方案，确认真要挽留了才把额度记上去
-    res = policy.build_resolution(order, customer, scenario, elig, session.round + 1)
+    res = policy.build_resolution(order, customer, scenario, elig, session.round + 1, deps)
     action, offers, allow_retention = res["action"], res["offers"], res["allow_retention"]
 
     # 策略层判定不该再挽留（薅羊毛冷静期等）：直接放行标准退货。

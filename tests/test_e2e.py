@@ -380,15 +380,17 @@ def test_csat_rejects_out_of_range_scores():
 def test_used_item_blocks_only_no_reason_returns():
     """R-USED 原文是"不支持无理由退货"：使用类问题必须先用过才会发现，
     尺码试穿也不算明显使用，拿这条挡人会踩体验红线。"""
+    import deps as D
     import policy
     from models import ReturnReason as RR
     from store import ORDERS
+    d = D.build_default()
     used = ORDERS["ORD-1004"]      # used=True，窗口内
     assert used["used"] is True
-    assert policy.check_eligibility(used, RR.USAGE)["eligible"]
-    assert policy.check_eligibility(used, RR.SIZE_FIT)["eligible"]
-    assert policy.check_eligibility(used, RR.DAMAGED)["eligible"]
-    blocked = policy.check_eligibility(used, RR.CHANGED_MIND)
+    assert policy.check_eligibility(used, RR.USAGE, d)["eligible"]
+    assert policy.check_eligibility(used, RR.SIZE_FIT, d)["eligible"]
+    assert policy.check_eligibility(used, RR.DAMAGED, d)["eligible"]
+    blocked = policy.check_eligibility(used, RR.CHANGED_MIND, d)
     assert not blocked["eligible"]
     assert any(code == "R-USED" for code, _ in blocked["violated"])
 
