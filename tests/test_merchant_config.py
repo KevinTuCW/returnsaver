@@ -521,3 +521,45 @@ def test_disabled_rule_stops_blocking():
              "used": False, "category": "home"}
     elig = policy.check_eligibility(order, ReturnReason.CHANGED_MIND, d)
     assert elig["eligible"], elig
+
+
+# ════════════════════════════════ llm 路由读 deps
+def test_routing_reads_high_value_threshold_from_deps():
+    import dataclasses
+    import deps as D
+    import llm
+    from models import ModelTier, Scenario
+
+    cfg = dataclasses.replace(M.BUILTIN_DEFAULT, high_value_order_usd=50.0)
+    d = dataclasses.replace(D.build_default(), config=cfg)
+    tier, why = llm.route_generation(Scenario.VALUE_GAP, 0.1, 80.0, 1, "normal",
+                                     0.0, d)
+    assert tier is ModelTier.LARGE
+    assert why == "high_value_order_worth_the_spend"
+
+
+def test_routing_reads_cost_budget_from_deps():
+    """预算跟套餐走：starter 的 0.02 花完就该降模板。"""
+    import dataclasses
+    import deps as D
+    import llm
+    from models import ModelTier, Scenario
+
+    d = dataclasses.replace(D.build_default(), cost_budget_usd=0.02)
+    tier, why = llm.route_generation(Scenario.VALUE_GAP, 0.1, 100.0, 1, "normal",
+                                     0.02, d)
+    assert tier is ModelTier.NONE
+    assert why == "cost_budget_exhausted"
+
+
+def test_rule_intent_reads_emotion_threshold_from_deps():
+    import dataclasses
+    import deps as D
+    import llm
+
+    cfg = dataclasses.replace(M.BUILTIN_DEFAULT, emotion_hard_stop=0.60)
+    d = dataclasses.replace(D.build_default(), config=cfg)
+    # "失望" 给 0.45，低于 0.60，不该走硬停止那一支
+    res = llm.rule_intent("I am disappointed, I want to return", d)
+    assert res is not None
+    assert res.emotion < 0.60

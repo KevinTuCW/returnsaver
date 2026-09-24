@@ -141,7 +141,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         return _release(session, "这单我直接给你走退货，不再占用你时间。", "max_turns_reached")
 
     # ── S1 意图识别（规则快路 → 小模型，永不用大模型）
-    intent_res, meta = llm.classify_intent(req.message)
+    intent_res, meta = llm.classify_intent(req.message, deps)
     _track(session, meta)
     session.intent, session.reason = intent_res.intent.value, intent_res.reason.value
     session.emotion = max(session.emotion, intent_res.emotion)   # 情绪只升不降
@@ -235,7 +235,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # 生成侧动态路由
     tier, route_reason = llm.route_generation(
         scenario, session.emotion, order["total"], session.round,
-        customer.get("tier", "normal"), session.llm_cost_usd)
+        customer.get("tier", "normal"), session.llm_cost_usd, deps)
 
     ctx = {"customer_name": customer["name"], "product": order["product"],
            "scenario": scenario.value, "reason": session.reason,
