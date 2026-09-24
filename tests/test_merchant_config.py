@@ -285,3 +285,165 @@ def test_rules_mapping_still_usable():
     d2 = dataclasses.replace(d, version=5)
     assert d2.version == 5
     assert dict(d2.rules) == dict(d.rules)
+
+
+# ── Fix A: version 必须经 _coerce，非负整数，绝不抛异常 ─────────────────────
+
+def test_clamp_handles_infinite_version():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["version"] = float("inf")
+    cfg = M.clamp(fields)          # int(float("inf")) 本身会抛 OverflowError，不应逃逸
+    assert cfg.version == 0
+
+
+def test_clamp_truncates_fractional_version():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["version"] = 3.9
+    cfg = M.clamp(fields)
+    assert cfg.version == 3
+
+
+def test_clamp_floors_negative_version_at_zero():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["version"] = -5
+    cfg = M.clamp(fields)
+    assert cfg.version == 0
+
+
+# ── Fix B/C: 规则文案与 exceptions_note 的「空」判定必须挡住 None/数字，
+#            clamp 对空文案要回退到平台原文，不能丢弃这条规则 ──────────────
+
+def test_clamp_falls_back_blank_rule_body_instead_of_dropping():
+    """空文案不能被丢弃——丢弃等于关闭这条规则的展示，是朝不安全方向滑。
+    必须保留规则代码，只把文案换成平台默认值。"""
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {"R-WINDOW": "   "}
+    cfg = M.clamp(fields)
+    assert cfg.rules["R-WINDOW"] == M.BUILTIN_DEFAULT.rules["R-WINDOW"]
+
+
+def test_clamp_falls_back_none_rule_body():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {"R-WINDOW": None}
+    cfg = M.clamp(fields)
+    assert cfg.rules["R-WINDOW"] == M.BUILTIN_DEFAULT.rules["R-WINDOW"]
+
+
+def test_clamp_falls_back_non_string_rule_body():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {"R-WINDOW": 123}
+    cfg = M.clamp(fields)
+    assert cfg.rules["R-WINDOW"] == M.BUILTIN_DEFAULT.rules["R-WINDOW"]
+
+
+def test_validate_rejects_none_rule_body():
+    """str(None) == "None" 会骗过朴素的 .strip() 检查，必须显式挡 None。"""
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = dict(fields["rules"])
+    fields["rules"]["R-WINDOW"] = None
+    violations = M.validate(fields)
+    assert any(v.field == "R-WINDOW" for v in violations)
+
+
+def test_validate_rejects_numeric_rule_body():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = dict(fields["rules"])
+    fields["rules"]["R-WINDOW"] = 123
+    violations = M.validate(fields)
+    assert any(v.field == "R-WINDOW" for v in violations)
+
+
+def test_clamp_falls_back_none_exceptions_note():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["exceptions_note"] = None
+    cfg = M.clamp(fields)
+    assert cfg.exceptions_note == M.BUILTIN_DEFAULT.exceptions_note
+
+
+def test_validate_rejects_none_exceptions_note():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["exceptions_note"] = None
+    violations = M.validate(fields)
+    assert any(v.field == "exceptions_note" for v in violations)
+
+
+# ── Fix D: R-DAMAGE 不能只靠 disabled_rules 挡——rules 字典本身也要查 ────────
+
+def test_validate_rejects_damage_rule_missing_from_rules_dict():
+    """Task 9 的 save() 直接传 rules，未必同步维护 disabled_rules；
+    光查 disabled_rules 挡不住有人只删 rules 里的 R-DAMAGE。"""
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {k: v for k, v in fields["rules"].items() if k != "R-DAMAGE"}
+    # disabled_rules 刻意不同步更新，证明漏洞不是靠它才被堵上的
+    violations = M.validate(fields)
+    assert any(v.field == "R-DAMAGE" for v in violations)
+
+
+# ── Fix E: clamp 主动收编规则表，未知代码应被丢弃而非保留 ───────────────────
+
+def test_clamp_drops_unknown_rule_codes():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {"R-BOGUS": "some text"}
+    cfg = M.clamp(fields)
+    assert "R-BOGUS" not in cfg.rules
+
+
+# ── Fix H: 钉住 rules={}（显式清空）与 rules=None（缺省）的不同降级语义 ──────
+
+def test_clamp_rules_empty_dict_yields_curated_minimum():
+    """rules={} 是「显式清空」——clamp 收编后只留下不可停用的 R-DAMAGE，
+    不会像 rules=None 那样退回全部 5 条默认。"""
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = {}
+    cfg = M.clamp(fields)
+    assert set(cfg.rules) == set(M.IMMUTABLE_RULES)
+
+
+def test_clamp_rules_none_yields_all_defaults():
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields["rules"] = None
+    cfg = M.clamp(fields)
+    assert set(cfg.rules) == set(M.RULE_CODES)
+    assert dict(cfg.rules) == dict(M.BUILTIN_DEFAULT.rules)
+
+
+# ── Fix G: clamp 的输出必须永远能通过 validate——这是读闸/写闸自洽的不变量,
+#           本该能一次性抓到 B/C/E 三个问题 ─────────────────────────────────
+
+_HOSTILE_CLAMP_INPUTS = [
+    {"max_discount_pct": float("inf")},
+    {"max_discount_pct": float("-inf")},
+    {"max_discount_pct": float("nan")},
+    {"return_window_days": -100},
+    {"return_window_days": 10 ** 9},
+    {"instant_refund_cap_usd": "not-a-number"},
+    {"instant_refund_cap_usd": 10 ** 400},
+    {"rules": {"R-WINDOW": None, "R-DAMAGE": 123}},
+    {"rules": {"R-WINDOW": "   "}},
+    {"rules": {}},
+    {"rules": {"R-BOGUS": "x"}},
+    {"rules": "not-a-mapping"},
+    {"rules": None},
+    {"version": "v3"},
+    {"version": None},
+    {"version": float("inf")},
+    {"version": 3.9},
+    {"version": -5},
+    {"exceptions_note": ""},
+    {"exceptions_note": "   "},
+    {"exceptions_note": None},
+]
+
+
+@pytest.mark.parametrize("overrides", _HOSTILE_CLAMP_INPUTS, ids=[str(o) for o in _HOSTILE_CLAMP_INPUTS])
+def test_clamp_output_always_validates(overrides):
+    fields = M.BUILTIN_DEFAULT.as_fields()
+    fields.update(overrides)
+    cfg = M.clamp(fields)
+    assert M.validate(cfg.as_fields()) == [], \
+        f"clamp({overrides}) 的输出没能通过 validate"
+
+
+# ── Fix I 的推理由这两个已有测试覆盖，见 test_boundary_values_are_accepted
+#    （闭区间两端）与 test_clamp_emotion_repair_preserves_stricter_hard_stop
+#    （单边修复不越界）；这里不再重复。

@@ -50,12 +50,24 @@ def _coerce(raw: Any) -> float | None:
     各写各的迟早漂移。OverflowError 不是 ValueError 的子类，必须显式捕获——
     一个 400 位的整数曾能穿过 validate 直接抛到请求里。NaN 会让
     `max(lo, min(hi, nan))` 退化成 hi，即静默选中区间最宽松的一端，所以也要挡。
+    `int(float("inf"))` 本身也会抛 OverflowError——version 字段同样经这里过滤，
+    所以它不需要另开一套 try/except。
     """
     try:
         v = float(raw)
     except (TypeError, ValueError, OverflowError):
         return None
     return v if math.isfinite(v) else None
+
+
+def _is_blank(value: Any) -> bool:
+    """value 是否等价于「未填写」。
+
+    只有非空字符串（strip 后）算有效值；None/数字/其它类型一律当作空——
+    `str(None) == "None"` 会让朴素的 `not str(v).strip()` 检查失手放行 None，
+    JSONB/text 列里 None 正是「未设置」最自然的表示，必须显式挡。
+    """
+    return not (isinstance(value, str) and value.strip())
 
 
 @dataclass(frozen=True)
@@ -66,7 +78,14 @@ class Violation:
 
 @dataclass(frozen=True)
 class MerchantConfig:
-    """一个租户在某个版本上的完整策略快照。不可变——快照就该是快照。"""
+    """一个租户在某个版本上的完整策略快照。不可变——快照就该是快照。
+
+    `as_fields()` 是唯一支持的序列化路径。`rules` 是 `mappingproxy`（见
+    `__post_init__`），`dataclasses.asdict()`/`copy.deepcopy()`/`pickle.dumps()`
+    都会在它上面抛 `TypeError: cannot pickle 'mappingproxy' object`——这是刻意
+    保留的取舍（模块级共享的 BUILTIN_DEFAULT.rules 不可变，比兼容这几个内置函数
+    更重要），不是待修的 bug。
+    """
     return_window_days: int
     max_discount_pct: float
     instant_refund_cap_usd: float
@@ -153,15 +172,21 @@ def validate(fields: dict[str, Any]) -> list[Violation]:
     # decline_must_cite_rule）：空文案等于什么都没引用，未知代码没有对应文案。
     raw_rules = fields.get("rules")
     if isinstance(raw_rules, Mapping):
+        # disabled_rules 只是「客户端声称禁用了什么」；rules 本身才是权威来源。
+        # 一个只传 rules、没同步维护 disabled_rules 的写请求（Task 9 的
+        # merchant_store.save 正是这样）不该绕过消费者保护底线。
+        for code in IMMUTABLE_RULES:
+            if code not in raw_rules:
+                out.append(Violation(code, "该规则不可停用（消费者保护底线）"))
         for code, body in raw_rules.items():
             if code not in RULE_CODES:
                 out.append(Violation(code, "未知规则代码"))
-            elif not str(body).strip():
+            elif _is_blank(body):
                 out.append(Violation(code, "规则内容不能为空——婉拒时要展示给客户"))
     elif raw_rules is not None:
         out.append(Violation("rules", f"不是合法的规则映射：{raw_rules!r}"))
 
-    if not str(fields.get("exceptions_note", "")).strip():
+    if _is_blank(fields.get("exceptions_note")):
         out.append(Violation("exceptions_note", "不能为空——婉拒时要展示给客户"))
 
     return out
@@ -186,22 +211,35 @@ def clamp(fields: dict[str, Any]) -> MerchantConfig:
 
     # 单边修复：保留 hard_stop（它是安全规则，低=严），只把 large_model 压到它
     # 下面。绝不反过来抬高 hard_stop——那是朝不安全方向改一个商家设对了的护栏。
-    # BOUNDS 保证这总是可行：large_model 下界 0.20 < hard_stop 下界 0.50。
+    # 上界不需要再夹：这个分支只在 hs <= BOUNDS[large_model].hi 时才会触发（hs
+    # 更大的话 large_model 不可能 >= hs，因为 large_model 本身已经夹到
+    # <= BOUNDS[large_model].hi 了），所以 hs - GAP < hs <= hi_lm 恒成立——这条
+    # 对任意 BOUNDS 取值都对，不依赖具体数字。下界则要看具体数字：本表
+    # hard_stop.lo(0.50) - GAP(0.49) 仍然 > large_model.lo(0.20)，但这是这张表
+    # 的巧合，不是结构性保证，换一张表可能不成立，所以下界的 max() 保留作纵深
+    # 防御，不删。
     if vals["emotion_large_model"] >= vals["emotion_hard_stop"]:
         lo, _ = BOUNDS["emotion_large_model"]
         vals["emotion_large_model"] = max(lo, vals["emotion_hard_stop"] - EMOTION_GAP)
 
+    # 规则表：clamp 在这里主动收编，不是透传。未知代码丢弃（clamp 本就是在整理
+    # 这张表，留着没有对应文案的代码没有意义）；R-DAMAGE 等消费者保护底线强制在
+    # 场；任何字段（含缺失代码本身）的空/None/非字符串文案，回退到平台原文而不
+    # 是丢弃这条规则——丢弃等于关闭这条规则的展示，是朝不安全方向滑；回退保留
+    # 规则仍然生效、只是文案换成默认值，方向和 exceptions_note 的兜底一致。
     raw_rules = fields.get("rules")
     rules = dict(raw_rules) if isinstance(raw_rules, Mapping) else dict(BUILTIN_DEFAULT.rules)
+    rules = {code: (body if not _is_blank(body) else BUILTIN_DEFAULT.rules[code])
+             for code, body in rules.items() if code in RULE_CODES}
     for code in IMMUTABLE_RULES:                      # 强制在场
         rules.setdefault(code, BUILTIN_DEFAULT.rules[code])
 
-    note = str(fields.get("exceptions_note", "")).strip() \
-        or BUILTIN_DEFAULT.exceptions_note
+    note = fields.get("exceptions_note")
+    note = note.strip() if not _is_blank(note) else BUILTIN_DEFAULT.exceptions_note
 
-    try:
-        version = int(fields.get("version", 0))
-    except (TypeError, ValueError):
-        version = 0
+    # version 是非负整数快照号。_coerce 已经挡了非数字/None/NaN/inf（含
+    # int(inf) 会抛的 OverflowError）；这里只需再夹住负数、显式截断小数。
+    v = _coerce(fields.get("version", 0))
+    version = max(0, int(v)) if v is not None else 0
 
     return MerchantConfig(**vals, exceptions_note=note, rules=rules, version=version)
