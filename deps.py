@@ -59,8 +59,14 @@ def build(principal, session) -> RetentionDeps:
 
     cfg, degraded = MS.load(principal.tenant_id, session.config_version)
     if db.enabled():
-        t, c = principal.tenant_id, principal.customer_id
-        get_order = lambda oid: db.fetch_order(oid, tenant_id=t, customer_id=c)   # noqa: E731
+        t = principal.tenant_id
+        # 归属用**会话的 customer**，不是 principal 的。
+        # API key 标识的是租户（商家）；客户主体由上游（helpmate）鉴权后透传在
+        # 请求体里。key 若本身绑定到某个客户（"dji:Alice"），app 层会先校验它与
+        # 会话主体一致，所以这里用会话的值是安全的。
+        # 读 session.customer_id 而非提前取值：它在 _negotiate 里可能才被赋上。
+        get_order = lambda oid: db.fetch_order(                                   # noqa: E731
+            oid, tenant_id=t, customer_id=session.customer_id)
         get_orders_of = lambda cid: db.fetch_orders_of(t, cid)                    # noqa: E731
         get_customer = lambda cid: db.fetch_customer(t, cid)                      # noqa: E731
     else:

@@ -322,6 +322,19 @@ def fetch_order(order_id: str, *, tenant_id: str,
     return _order_row(dict(rows[0])) if rows else None
 
 
+def fetch_order_for_tenant(order_id: str, tenant_id: str) -> dict | None:
+    """只按租户取单，**不做客户归属校验**。仅供 L4 兑付路径使用。
+
+    为什么这里可以不校验客户：能走到这一步的调用方持有一个 HMAC 签名的
+    offer_token，而那个 token 是在签发时已经通过归属校验的会话里产生的——
+    token 本身就是凭据。L4 在这里查订单是为了**重算金额上限**，不是为了鉴权。
+    租户边界仍然守着，所以拿别的租户的单号也取不到。
+    """
+    rows = _query(_ORDER_SELECT + " WHERE o.order_id=%s AND o.tenant_id=%s",
+                  (order_id, tenant_id))
+    return _order_row(dict(rows[0])) if rows else None
+
+
 def fetch_orders_of(tenant_id: str, customer_id: str) -> list[dict]:
     rows = _query(_ORDER_SELECT + " WHERE o.tenant_id=%s AND o.customer_id=%s",
                   (tenant_id, customer_id))

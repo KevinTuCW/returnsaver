@@ -125,6 +125,12 @@ def negotiate(req: NegotiateRequest,
         # 与 helpmate 在 002_order_ownership 里学到的是同一课，换个对象重演。
         raise HTTPException(status_code=403,
                             detail="session belongs to another tenant")
+    # key 若绑定到具体客户（"tenant:customer"），它只能代表那个客户说话。
+    # 租户级 key（服务间调用）不带客户身份，客户主体由上游鉴权后透传。
+    if principal.customer_id and req.customer_id \
+            and principal.customer_id != req.customer_id:
+        raise HTTPException(status_code=403,
+                            detail="api key is bound to another customer")
     deps = D.build(principal, session)
     with obs.session_trace(session.session_id, req.customer_id, req.message) as span:
         out = _negotiate(req, session, deps)
@@ -369,10 +375,14 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 
 # ════════════════════════════════════════════ L4 执行层
 def _accept_get_order(principal: Principal):
-    """accept 没有会话上下文，自己按 principal 取单。归属校验照样在。"""
+    """accept 没有会话上下文，只按租户取单。
+
+    不做客户归属校验是有意的：调用方持有的 HMAC offer_token 是在一个已通过
+    归属校验的会话里签发的，token 本身就是凭据。这里查订单是为了让 L4 重算
+    金额上限，不是为了鉴权。租户边界仍然守着。
+    """
     if db.enabled():
-        return lambda oid: db.fetch_order(oid, tenant_id=principal.tenant_id,
-                                          customer_id=principal.customer_id)
+        return lambda oid: db.fetch_order_for_tenant(oid, principal.tenant_id)
     return lambda oid: store.ORDERS.get(oid)
 
 

@@ -119,3 +119,29 @@ def test_health_goes_not_ok_when_config_degraded(monkeypatch):
     assert h["config"]["degraded"] is True
     assert h["ok"] is False
     MS.cache_clear()
+
+
+def test_customer_scoped_key_cannot_act_for_another_customer(monkeypatch):
+    """key 绑到 C-001 就只能代表 C-001 说话。"""
+    _keys(monkeypatch, {"sk-alice": "public:C-001"})
+    r = client.post("/api/negotiate",
+                    headers={"X-API-Key": "sk-alice"},
+                    json={"customer_id": "C-003", "message": "I want to return"})
+    assert r.status_code == 403, r.json()
+    assert r.json()["detail"] == "api key is bound to another customer"
+
+
+def test_tenant_scoped_key_may_pass_customer_through(monkeypatch):
+    """服务间调用：租户级 key 不带客户身份，客户主体由上游鉴权后透传。
+
+    这条是 T16 抓到的回归——原先订单归属绑的是 principal.customer_id，租户级
+    key 下它恒为 None，postgres 模式里每个订单查询都返回 None，六个场景全
+    order_mismatch。memory 模式看不出来，因为 store.ORDERS 根本不校验归属。
+    """
+    _keys(monkeypatch, {"sk-svc": "public"})
+    r = client.post("/api/negotiate",
+                    headers={"X-API-Key": "sk-svc"},
+                    json={"customer_id": "C-001", "message": "I want to return"})
+    assert r.status_code == 200, r.json()
+    assert r.json()["status"] == "awaiting_order_confirmation"
+    assert r.json()["candidates"], "租户级 key 必须能查到透传客户的订单"
