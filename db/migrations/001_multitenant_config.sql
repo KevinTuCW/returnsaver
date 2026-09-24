@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS rs_order_attrs (
     order_id              TEXT    PRIMARY KEY
         REFERENCES orders (order_id) ON DELETE CASCADE,
     sku                   TEXT,
+    -- 商品展示名。helpmate 的 orders 没有这一列（它只有 customer 姓名），而挽留
+    -- 话术要说出商品名（"Merino Crew Tee 穿起来偏小"）。属于本服务的扩展字段，
+    -- 所以放这里，而不是去挪用 orders.customer。
+    product               TEXT,
     category              TEXT,
     gross_margin_pct      REAL,
     delivered_at          TIMESTAMPTZ,
@@ -95,6 +99,9 @@ CREATE TABLE IF NOT EXISTS rs_order_attrs (
     negotiations_last_90d INT     NOT NULL DEFAULT 0,
     has_manual            BOOLEAN NOT NULL DEFAULT false
 );
+
+-- 对已建表的库补列（CREATE TABLE IF NOT EXISTS 不会改已有表结构）
+ALTER TABLE rs_order_attrs ADD COLUMN IF NOT EXISTS product TEXT;
 
 -- ───────────────────────────── 客户属性（helpmate 没有客户表）
 -- 不设到 orders 的外键：客户属性的生命周期比单个订单长，且 helpmate 侧

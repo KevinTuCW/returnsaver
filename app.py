@@ -167,8 +167,8 @@ def _negotiate(req: NegotiateRequest, session: store.Session,
                              "offer": None, "next_action": "handoff_to_main_agent"})
 
     # ── S2 用户 / 订单校验
-    customer = store.CUSTOMERS.get(session.customer_id or "")
-    orders = store.orders_of(session.customer_id) if session.customer_id else []
+    customer = deps.get_customer(session.customer_id or "")
+    orders = deps.get_orders_of(session.customer_id) if session.customer_id else []
     ok, why = policy.verify_customer_and_orders(customer, orders)
     if not ok:
         session.stage = Stage.CLOSED
@@ -199,7 +199,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session,
             "next_action": "reply_with_confirm_order_id",
         })
 
-    order = store.ORDERS.get(order_id)
+    order = deps.get_order(order_id)
     if not order or order["customer_id"] != session.customer_id:
         return _ok(session, {"status": "order_mismatch",
                              "reply": "这个订单号和你的账号对不上，麻烦再核对一下。",
@@ -368,6 +368,14 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 
 
 # ════════════════════════════════════════════ L4 执行层
+def _accept_get_order(principal: Principal):
+    """accept 没有会话上下文，自己按 principal 取单。归属校验照样在。"""
+    if db.enabled():
+        return lambda oid: db.fetch_order(oid, tenant_id=principal.tenant_id,
+                                          customer_id=principal.customer_id)
+    return lambda oid: store.ORDERS.get(oid)
+
+
 @app.post("/api/accept")
 def accept(req: AcceptRequest,
            principal: Principal = Depends(require_principal)):
@@ -385,7 +393,8 @@ def accept(req: AcceptRequest,
     try:
         payload = G.verify_offer_token(
             req.offer_token,
-            get_order=lambda oid: store.ORDERS.get(oid),
+            # accept 没有会话上下文，所以自己按 principal 取单（仍带归属校验）
+            get_order=_accept_get_order(principal),
             # 按 token 里的 cfg_v 回查那一版——快照语义在这里闭合。
             # 商家在 TTL 内调低上限，不会否掉系统已经承诺给客户的方案；
             # 但也不是免检：超过签发那一版的上限照样拦。

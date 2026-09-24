@@ -247,6 +247,94 @@ def insert_merchant_config(tenant_id: str, fields: dict, *, created_by: str,
     return version
 
 
+# ──────────────────────────────────────────── 订单 / 客户属性
+# 缺 attrs 行时的默认值。选取原则：**缺数据永不导致拒退**——少一个挽留选项
+# 可以接受，凭空拒掉一个合规退货不行。所以会拦人的三个字段
+# （final_sale / opened / used）一律默认 False。
+ORDER_ATTR_DEFAULTS = {
+    "sku": None, "product": None, "category": None, "gross_margin_pct": 0.5,
+    "final_sale": False, "opened": False, "used": False,
+    "sizes_in_stock": [], "repairable": False,
+    "negotiations_last_90d": 0, "has_manual": False,
+}
+
+CUSTOMER_ATTR_DEFAULTS = {"tier": "normal", "lifetime_orders": 0,
+                          "returns_last_90d": 0, "risk_flag": False}
+
+
+def merge_order_attrs(order: dict, attrs: dict | None) -> dict:
+    """把 helpmate 的 orders 行与 rs_order_attrs 合成策略引擎要的形状。
+
+    days_since_delivery 由 delivered_at 现算：数据库里存「距今多少天」的整数
+    第二天就是错的。mock 能蒙过去只因为它从不持久化。
+    """
+    import datetime as dt
+    a = dict(ORDER_ATTR_DEFAULTS)
+    if attrs:
+        for k in ORDER_ATTR_DEFAULTS:
+            if attrs.get(k) is not None:
+                a[k] = attrs[k]
+    delivered = (attrs or {}).get("delivered_at")
+    if delivered is None:
+        days = 0                      # 按"刚签收"算，不会因窗口被拒
+    else:
+        if delivered.tzinfo is None:
+            delivered = delivered.replace(tzinfo=dt.timezone.utc)
+        days = max(0, (dt.datetime.now(dt.timezone.utc) - delivered).days)
+    return {**order, **a,
+            "days_since_delivery": days,
+            # 话术要有个能念出来的名字，退到 sku 再退到单号
+            "product": a["product"] or a["sku"] or order["order_id"],
+            "total": float(order["total"])}
+
+
+def merge_customer_attrs(customer_id: str, attrs: dict | None) -> dict:
+    """缺行时默认 normal / 非风险——不把陌生客户误判成薅羊毛。"""
+    a = dict(CUSTOMER_ATTR_DEFAULTS)
+    if attrs:
+        for k in CUSTOMER_ATTR_DEFAULTS:
+            if attrs.get(k) is not None:
+                a[k] = attrs[k]
+    return {"customer_id": customer_id,
+            "name": (attrs or {}).get("name") or customer_id, **a}
+
+
+_ORDER_SELECT = """SELECT o.order_id, o.customer_id, o.customer, o.status,
+                          o.total, a.*
+                   FROM orders o LEFT JOIN rs_order_attrs a USING (order_id)"""
+
+
+def _order_row(r: dict) -> dict:
+    return merge_order_attrs(
+        {"order_id": r["order_id"], "customer_id": r["customer_id"],
+         "status": r["status"], "total": r["total"]}, r)
+
+
+def fetch_order(order_id: str, *, tenant_id: str,
+                customer_id: str | None) -> dict | None:
+    """带归属校验的订单读取。照 helpmate 的 get_order：报一个陌生单号只会
+    得到「未找到」，而不是别人的订单。customer_id=None 表示无订单访问权。"""
+    if customer_id is None:
+        return None
+    rows = _query(_ORDER_SELECT + """ WHERE o.order_id=%s AND o.tenant_id=%s
+                                        AND o.customer_id=%s""",
+                  (order_id, tenant_id, customer_id))
+    return _order_row(dict(rows[0])) if rows else None
+
+
+def fetch_orders_of(tenant_id: str, customer_id: str) -> list[dict]:
+    rows = _query(_ORDER_SELECT + " WHERE o.tenant_id=%s AND o.customer_id=%s",
+                  (tenant_id, customer_id))
+    return [_order_row(dict(r)) for r in rows]
+
+
+def fetch_customer(tenant_id: str, customer_id: str) -> dict | None:
+    rows = _query("""SELECT * FROM rs_customer_attrs
+                     WHERE tenant_id=%s AND customer_id=%s""",
+                  (tenant_id, customer_id))
+    return merge_customer_attrs(customer_id, dict(rows[0]) if rows else None)
+
+
 def close() -> None:
     global _pool
     if _pool is not None:

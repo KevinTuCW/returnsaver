@@ -656,3 +656,58 @@ def test_db_config_cols_match_merchant_config_fields():
         f"只在 MerchantConfig: {dataclass_fields - set(db.CONFIG_COLS)}")
     # BOUNDS 覆盖除 exceptions_note 外的全部数值字段
     assert set(M.BOUNDS) == dataclass_fields - {"exceptions_note"}
+
+
+# ════════════════════════════════ 订单/客户属性的保守默认
+def test_missing_order_attrs_never_denies_eligible_return():
+    """缺 rs_order_attrs 行时，保守默认不能凭空拒掉一个合规退货。"""
+    import db
+    merged = db.merge_order_attrs(
+        {"order_id": "O-9", "total": 100.0, "customer_id": "C-1",
+         "status": "delivered"}, None)
+    assert merged["final_sale"] is False
+    assert merged["opened"] is False
+    assert merged["used"] is False
+    assert merged["repairable"] is False
+    assert merged["sizes_in_stock"] == []
+    assert merged["negotiations_last_90d"] == 0
+    # 缺 delivered_at 时按"刚签收"算，不会因窗口被拒
+    assert merged["days_since_delivery"] == 0
+    # 话术要有个能念出来的名字
+    assert merged["product"] == "O-9"
+
+
+def test_delivered_at_converts_to_days():
+    import datetime as dt
+
+    import db
+    ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=41)
+    merged = db.merge_order_attrs(
+        {"order_id": "O-9", "total": 100.0},
+        {"delivered_at": ago, "sku": "X", "product": "Down Jacket",
+         "category": "apparel", "final_sale": False, "opened": True,
+         "used": True, "sizes_in_stock": ["M"], "repairable": True,
+         "negotiations_last_90d": 0, "has_manual": True,
+         "gross_margin_pct": 0.5})
+    assert merged["days_since_delivery"] == 41
+    assert merged["product"] == "Down Jacket"
+
+
+def test_missing_customer_attrs_defaults_to_normal_non_risky():
+    import db
+    c = db.merge_customer_attrs("C-1", None)
+    assert c["tier"] == "normal"
+    assert c["risk_flag"] is False
+    assert c["returns_last_90d"] == 0
+
+
+def test_order_attr_defaults_cover_every_field_policy_reads():
+    """policy.py 读的订单字段必须都能从 merge 出来，否则线上 KeyError。"""
+    import db
+    merged = db.merge_order_attrs(
+        {"order_id": "O-1", "total": 50.0, "customer_id": "C-1",
+         "status": "delivered"}, None)
+    for field in ("days_since_delivery", "final_sale", "category", "opened",
+                  "used", "sku", "total", "repairable", "sizes_in_stock",
+                  "negotiations_last_90d"):
+        assert field in merged, field

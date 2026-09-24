@@ -53,10 +53,21 @@ def build(principal, session) -> RetentionDeps:
     版本从 **session** 取而不是取租户当前版本——这就是快照语义的落点：商家
     中途发了新版本，进行中的会话仍按它开始时钉住的那一版结算。
     """
+    import db
     import merchant_store as MS
     import store
 
     cfg, degraded = MS.load(principal.tenant_id, session.config_version)
+    if db.enabled():
+        t, c = principal.tenant_id, principal.customer_id
+        get_order = lambda oid: db.fetch_order(oid, tenant_id=t, customer_id=c)   # noqa: E731
+        get_orders_of = lambda cid: db.fetch_orders_of(t, cid)                    # noqa: E731
+        get_customer = lambda cid: db.fetch_customer(t, cid)                      # noqa: E731
+    else:
+        # memory 模式：mock 语料。零配置演示与 hermetic 测试走这条
+        get_order = lambda oid: store.ORDERS.get(oid)                             # noqa: E731
+        get_orders_of = lambda cid: store.orders_of(cid)                          # noqa: E731
+        get_customer = lambda cid: store.CUSTOMERS.get(cid)                       # noqa: E731
     return RetentionDeps(
         config=cfg,
         config_version=cfg.version,
@@ -64,8 +75,8 @@ def build(principal, session) -> RetentionDeps:
         # 成本预算读实时值、不进快照：没有任何 offer_token 依赖它，
         # 为它加一套不可变机制是纯开销
         cost_budget_usd=MS.cost_budget(principal.tenant_id),
-        get_order=lambda oid: store.ORDERS.get(oid),
-        get_orders_of=lambda cid: store.orders_of(cid),
-        get_customer=lambda cid: store.CUSTOMERS.get(cid),
+        get_order=get_order,
+        get_orders_of=get_orders_of,
+        get_customer=get_customer,
         degraded=degraded,
     )
