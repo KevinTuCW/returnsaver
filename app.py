@@ -19,7 +19,6 @@ import db
 import deps as D
 import guardrails as G
 import llm
-import merchant as M
 import merchant_store as MS
 import metrics
 import observability as obs
@@ -370,7 +369,8 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 
 # ════════════════════════════════════════════ L4 执行层
 @app.post("/api/accept")
-def accept(req: AcceptRequest):
+def accept(req: AcceptRequest,
+           principal: Principal = Depends(require_principal)):
     if req.idempotency_key in store.EXECUTED:
         return {"status": "already_executed", **store.EXECUTED[req.idempotency_key]}
     # 内存幂等表活不过重启，光靠它会在重启后对同一个 key 二次执行 = 二次发钱。
@@ -386,7 +386,10 @@ def accept(req: AcceptRequest):
         payload = G.verify_offer_token(
             req.offer_token,
             get_order=lambda oid: store.ORDERS.get(oid),
-            load_config=lambda v: M.BUILTIN_DEFAULT)   # Task 11 换成按版本回查
+            # 按 token 里的 cfg_v 回查那一版——快照语义在这里闭合。
+            # 商家在 TTL 内调低上限，不会否掉系统已经承诺给客户的方案；
+            # 但也不是免检：超过签发那一版的上限照样拦。
+            load_config=lambda v: MS.load(principal.tenant_id, v)[0])
     except G.GuardrailTripped as e:
         metrics.record_guardrail(e.layer, e.code)
         print(f"GUARDRAIL_TRIGGERED layer={e.layer} code={e.code} detail={e.detail}")
