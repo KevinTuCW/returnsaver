@@ -9,14 +9,19 @@ import hashlib
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
+from auth import Principal, require_principal
 import config as C
 import db
+import deps as D
 import guardrails as G
 import llm
+import merchant_store as MS
 import metrics
 import observability as obs
 import policy
@@ -32,9 +37,75 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Return Saver", version="0.3.0", lifespan=lifespan)
+WEB = Path(__file__).resolve().parent / "web"
+app.mount("/admin/assets", StaticFiles(directory=WEB / "admin"), name="admin-assets")
 
 HOLDOUT_PCT = C.HOLDOUT_PCT           # 生产置 10：对照组做增量归因
 ESCAPE = "随时回「还是要退」，我立刻转标准退货，不会多问一句。"
+ESCAPE_EN = 'Reply "I still want to return it" at any time and I will start the standard return immediately.'
+
+
+def _is_english(text: str) -> bool:
+    return bool(text and not any("\u4e00" <= char <= "\u9fff" for char in text)
+                and any(char.isalpha() for char in text))
+
+
+def _english_reply(payload: dict) -> str:
+    status = payload.get("status")
+    if status == "awaiting_order_confirmation":
+        return "To make sure I have the right item, please confirm which order you want to return."
+    if status == "verification_failed":
+        return "I couldn't find a matching order. Could you share the order number or email used at checkout?"
+    if status == "no_returnable_order":
+        return "I couldn't find a recently delivered order that is eligible for return. Would you like help checking another order?"
+    if status == "order_mismatch":
+        return "That order number doesn't match your account. Please check it and try again."
+    if status == "passthrough":
+        return "I'll hand this over to a support specialist who can help you."
+    if status in ("offer_made", "declined"):
+        return "I'm sorry this didn't work out as expected. I can offer the option below. Would that work for you?"
+    if status == "instant_refund":
+        eta = (payload.get("refund") or {}).get("eta", "Your bank may take 1-3 business days to post it")
+        return f"I've issued the refund immediately. {eta}."
+    if status == "escalated":
+        ticket = payload.get("ticket") or {}
+        return (f"I don't want an automated decision on this order. A specialist will review it within "
+                f"{ticket.get('sla_hours', 2)} hours. Your ticket is {ticket.get('ticket_id', 'open')}, "
+                "and your return window is protected while you wait.")
+    if status in ("released", "holdout_control"):
+        return "I've started the standard return process for you. You won't need to answer any more questions."
+    return payload.get("reply", "")
+
+
+def _localize_offer(offer: dict | None) -> dict | None:
+    if not offer:
+        return offer
+    labels = {
+        "FREE_EXCHANGE": "Free size exchange with round-trip shipping included",
+        "FREE_REPAIR": "Free repair with pickup and return shipping included",
+        "SEND_GUIDE": "Setup guide and a 14-day return-window extension",
+        "SEND_VIDEO_GUIDE": "90-second setup video and a 14-day return-window extension",
+        "LIVE_ONBOARDING": "Free 10-minute one-to-one setup session",
+        "GOODWILL_COUPON": "Goodwill coupon for a future purchase",
+    }
+    label = labels.get(offer.get("offer_id"))
+    if not label and offer.get("type") == "store_credit":
+        label = "Keep the item and receive store credit"
+    if not label and offer.get("type") == "partial_refund":
+        label = "Keep the item and receive a partial refund"
+    return {**offer, "label": label or offer.get("label", "Available resolution")}
+
+
+@app.get("/admin")
+@app.get("/admin/")
+def admin_shell():
+    """Merchant app shell.
+
+    Shopify is a delivery style here, not a platform dependency: no OAuth, no
+    App Bridge token, just an embedded-app shaped shell that C1/C2/C3 can mount
+    into later.
+    """
+    return FileResponse(WEB / "admin" / "index.html")
 
 
 # ════════════════════════════════════════════ 工具
@@ -42,7 +113,7 @@ def _ok(session: store.Session, payload: dict, allow_retention: bool = True) -> 
     """统一出口：补上体验不变量要求的字段，并在返回前自检。"""
     payload.setdefault("session_id", session.session_id)
     payload.setdefault("stage", session.stage.value)
-    payload.setdefault("escape_hatch", ESCAPE)
+    payload.setdefault("escape_hatch", ESCAPE_EN if session.language == "en" else ESCAPE)
     payload.setdefault("cost_usd", round(session.llm_cost_usd, 6))
     payload.setdefault("model_calls", session.model_calls)
     try:
@@ -58,6 +129,16 @@ def _ok(session: store.Session, payload: dict, allow_retention: bool = True) -> 
                                  "escalated", "released"):
         obs.score(session.session_id, "retention-outcome", payload["status"],
                   data_type="CATEGORICAL")
+    if session.language == "en":
+        if payload.get("reply") and not _is_english(payload["reply"]):
+            payload["reply"] = _english_reply(payload)
+        payload["offer"] = _localize_offer(payload.get("offer"))
+        if payload.get("alternatives"):
+            payload["alternatives"] = [_localize_offer(item) for item in payload["alternatives"]]
+    reply = payload.get("reply")
+    if reply:
+        session.messages.append({"role": "agent", "text": reply, "at": int(time.time())})
+        session.last_activity_at = time.time()
     store.persist(session)
     return payload
 
@@ -105,14 +186,35 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
 
 # ════════════════════════════════════════════ 主入口
 @app.post("/api/negotiate")
-def negotiate(req: NegotiateRequest):
+def negotiate(req: NegotiateRequest,
+              principal: Principal = Depends(require_principal)):
     """一次调用 = 一个 Langfuse span，session_id 把整段对话串起来。
 
     会话必须在打开 trace **之前**解析出来——否则首轮的 trace 会挂到 "new" 上，
     Langfuse 里就聚合不成一段完整对话。"""
-    session = store.get_session(req.session_id) or store.new_session(req.customer_id)
+    session = store.get_session(req.session_id)
+    if session is None:
+        # 新会话：钉住该租户当前版本。这是快照语义的锚点。
+        session = store.new_session(
+            req.customer_id, tenant_id=principal.tenant_id,
+            config_version=MS.current_version(principal.tenant_id))
+    elif session.tenant_id != principal.tenant_id:
+        # 会话是租户级资源。拿 B 租户的 key 续 A 租户的会话就是横向越权，
+        # 与 helpmate 在 002_order_ownership 里学到的是同一课，换个对象重演。
+        raise HTTPException(status_code=403,
+                            detail="session belongs to another tenant")
+    # key 若绑定到具体客户（"tenant:customer"），它只能代表那个客户说话。
+    # 租户级 key（服务间调用）不带客户身份，客户主体由上游鉴权后透传。
+    if principal.customer_id and req.customer_id \
+            and principal.customer_id != req.customer_id:
+        raise HTTPException(status_code=403,
+                            detail="api key is bound to another customer")
+    deps = D.build(principal, session)
+    session.messages.append({"role": "customer", "text": req.message,
+                             "at": int(time.time())})
+    session.last_activity_at = time.time()
     with obs.session_trace(session.session_id, req.customer_id, req.message) as span:
-        out = _negotiate(req, session)
+        out = _negotiate(req, session, deps)
         if span is not None and not isinstance(out, JSONResponse):
             obs.update(span, output={"status": out.get("status"),
                                      "scenario": out.get("scenario"),
@@ -122,7 +224,10 @@ def negotiate(req: NegotiateRequest):
         return out
 
 
-def _negotiate(req: NegotiateRequest, session: store.Session):
+def _negotiate(req: NegotiateRequest, session: store.Session,
+               deps: D.RetentionDeps):
+    if session.turns == 0:
+        session.language = "en" if _is_english(req.message) else "zh"
     if req.customer_id:
         session.customer_id = req.customer_id
     session.turns += 1
@@ -132,27 +237,29 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         return _release(session, "没问题，已经为你开启退货流程，物流单马上发到邮箱。",
                         "user_opted_out")
     # round 只统计"真正发出过的挽留轮次"——确认订单、澄清身份都不占额度
-    if session.round >= C.MAX_NEGOTIATION_ROUNDS:
+    if session.round >= deps.config.max_negotiation_rounds:
         return _release(session, "不耽误你了，退货流程已经开好。", "max_rounds_reached")
-    if session.turns > C.MAX_SESSION_TURNS:
+    if session.turns > deps.config.max_session_turns:
         return _release(session, "这单我直接给你走退货，不再占用你时间。", "max_turns_reached")
 
     # ── S1 意图识别（规则快路 → 小模型，永不用大模型）
-    intent_res, meta = llm.classify_intent(req.message)
-    _track(session, meta)
-    session.intent, session.reason = intent_res.intent.value, intent_res.reason.value
-    session.emotion = max(session.emotion, intent_res.emotion)   # 情绪只升不降
+    # 订单确认是上一轮退货意图的延续。只说 "Yes, ORD-1001" 本身不像退货请求，
+    # 若重新分类会被判成 OTHER，插件随后 passthrough 回 RAG，确认流程永远走不完。
+    if not (req.confirm_order_id and session.intent and session.reason):
+        intent_res, meta = llm.classify_intent(req.message, deps)
+        _track(session, meta)
+        session.intent, session.reason = intent_res.intent.value, intent_res.reason.value
+        session.emotion = max(session.emotion, intent_res.emotion)   # 情绪只升不降
+        if intent_res.intent is Intent.OTHER:
+            session.stage = Stage.CLOSED
+            return _ok(session, {"status": "passthrough", "intent": session.intent,
+                                 "reply": "这个问题我转给人工客服同事，马上有人接。",
+                                 "offer": None, "next_action": "handoff_to_main_agent"})
     session.stage = Stage.VERIFY
 
-    if intent_res.intent is Intent.OTHER:
-        session.stage = Stage.CLOSED
-        return _ok(session, {"status": "passthrough", "intent": session.intent,
-                             "reply": "这个问题我转给人工客服同事，马上有人接。",
-                             "offer": None, "next_action": "handoff_to_main_agent"})
-
     # ── S2 用户 / 订单校验
-    customer = store.CUSTOMERS.get(session.customer_id or "")
-    orders = store.orders_of(session.customer_id) if session.customer_id else []
+    customer = deps.get_customer(session.customer_id or "")
+    orders = deps.get_orders_of(session.customer_id) if session.customer_id else []
     ok, why = policy.verify_customer_and_orders(customer, orders)
     if not ok:
         session.stage = Stage.CLOSED
@@ -183,7 +290,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
             "next_action": "reply_with_confirm_order_id",
         })
 
-    order = store.ORDERS.get(order_id)
+    order = deps.get_order(order_id)
     if not order or order["customer_id"] != session.customer_id:
         return _ok(session, {"status": "order_mismatch",
                              "reply": "这个订单号和你的账号对不上，麻烦再核对一下。",
@@ -204,20 +311,20 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # ── S4 售后规则核验
     session.stage = Stage.ELIGIBILITY
     reason = ReturnReason(session.reason)
-    elig = policy.check_eligibility(order, reason)
+    elig = policy.check_eligibility(order, reason, deps)
 
     # ── S5 场景分类 + 执行策略
     session.stage = Stage.EXECUTE
-    scenario = policy.classify_scenario(order, reason, session.emotion, elig)
+    scenario = policy.classify_scenario(order, reason, session.emotion, elig, deps)
     session.scenario = scenario.value
 
     # 情绪激烈场景：不生成任何挽留话术，直接分级执行（不消耗谈判额度）
     if scenario is Scenario.EMOTIONAL_INSIST:
-        res = policy.build_resolution(order, customer, scenario, elig, session.round)
+        res = policy.build_resolution(order, customer, scenario, elig, session.round, deps)
         return _emotional(session, order, res["action"], res["payload"])
 
     # 先按"假如这是下一轮"算方案，确认真要挽留了才把额度记上去
-    res = policy.build_resolution(order, customer, scenario, elig, session.round + 1)
+    res = policy.build_resolution(order, customer, scenario, elig, session.round + 1, deps)
     action, offers, allow_retention = res["action"], res["offers"], res["allow_retention"]
 
     # 策略层判定不该再挽留（薅羊毛冷静期等）：直接放行标准退货。
@@ -232,10 +339,11 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # 生成侧动态路由
     tier, route_reason = llm.route_generation(
         scenario, session.emotion, order["total"], session.round,
-        customer.get("tier", "normal"), session.llm_cost_usd)
+        customer.get("tier", "normal"), session.llm_cost_usd, deps)
 
     ctx = {"customer_name": customer["name"], "product": order["product"],
            "scenario": scenario.value, "reason": session.reason,
+           "language": "English" if session.language == "en" else "Chinese",
            "days_since_delivery": order["days_since_delivery"],
            "user_message": req.message}
     raw, gmeta = llm.generate_copy(tier, ctx, offers, req.force)
@@ -248,13 +356,13 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
     # 模板档：不过 LLM，直接渲染确定性文案
     if tier is ModelTier.NONE and not req.force:
         return _template_reply(session, order, scenario, action, offers,
-                               res["payload"], allow_retention)
+                               res["payload"], deps, allow_retention)
 
     # ── L2 / L3 护栏
     try:
         proposal = G.validate_proposal(raw, allowed_ids)
         offer = next(o for o in offers if o["offer_id"] == proposal.offer_id)
-        G.validate_value_cap(offer, order)
+        G.validate_value_cap(offer, order, deps)
         G.scan_output_text(proposal.message, approved)
     except G.GuardrailTripped as e:
         return _blocked(session, e)
@@ -266,7 +374,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
         "status": "offer_made", "scenario": scenario.value, "action": action.value,
         "reply": proposal.message,
         "offer": {**offer},
-        "offer_token": G.issue_offer_token(order_id, offer),
+        "offer_token": G.issue_offer_token(order_id, offer, deps),
         "alternatives": [{"offer_id": o["offer_id"], "label": o["label"]}
                          for o in offers if o["offer_id"] != offer["offer_id"]],
         "next_action": "await_customer_decision",
@@ -279,7 +387,7 @@ def _negotiate(req: NegotiateRequest, session: store.Session):
 # ════════════════════════════════════════════ 确定性模板分支（零 LLM 成本）
 def _template_reply(session: store.Session, order: dict, scenario: Scenario,
                     action: Action, offers: list[dict], pl: dict,
-                    allow_retention: bool = True) -> dict:
+                    deps: D.RetentionDeps, allow_retention: bool = True) -> dict:
     metrics.record_conversation(session.session_id, scenario.value, action.value,
                                 session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
@@ -292,7 +400,7 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
              "reply": reply, "cited_rules": cited, "policy_note": pl["policy_note"],
              "offer": alt, "next_action": "await_customer_decision"}
         if alt:
-            p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+            p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
         return _ok(session, p, allow_retention)
 
     alt = offers[0] if offers else None
@@ -300,7 +408,7 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
          "reply": "我先给你一个方案，你看合不合适。", "offer": alt,
          "next_action": "await_customer_decision"}
     if alt:
-        p["offer_token"] = G.issue_offer_token(order["order_id"], alt)
+        p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
     return _ok(session, p, allow_retention)
 
 
@@ -352,8 +460,21 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
 
 
 # ════════════════════════════════════════════ L4 执行层
+def _accept_get_order(principal: Principal):
+    """accept 没有会话上下文，只按租户取单。
+
+    不做客户归属校验是有意的：调用方持有的 HMAC offer_token 是在一个已通过
+    归属校验的会话里签发的，token 本身就是凭据。这里查订单是为了让 L4 重算
+    金额上限，不是为了鉴权。租户边界仍然守着。
+    """
+    if db.enabled():
+        return lambda oid: db.fetch_order_for_tenant(oid, principal.tenant_id)
+    return lambda oid: store.ORDERS.get(oid)
+
+
 @app.post("/api/accept")
-def accept(req: AcceptRequest):
+def accept(req: AcceptRequest,
+           principal: Principal = Depends(require_principal)):
     if req.idempotency_key in store.EXECUTED:
         return {"status": "already_executed", **store.EXECUTED[req.idempotency_key]}
     # 内存幂等表活不过重启，光靠它会在重启后对同一个 key 二次执行 = 二次发钱。
@@ -366,7 +487,14 @@ def accept(req: AcceptRequest):
         store.EXECUTED[req.idempotency_key] = result      # 回填，后续重放不再查库
         return {"status": "already_executed", **result}
     try:
-        payload = G.verify_offer_token(req.offer_token)
+        payload = G.verify_offer_token(
+            req.offer_token,
+            # accept 没有会话上下文，所以自己按 principal 取单（仍带归属校验）
+            get_order=_accept_get_order(principal),
+            # 按 token 里的 cfg_v 回查那一版——快照语义在这里闭合。
+            # 商家在 TTL 内调低上限，不会否掉系统已经承诺给客户的方案；
+            # 但也不是免检：超过签发那一版的上限照样拦。
+            load_config=lambda v: MS.load(principal.tenant_id, v)[0])
     except G.GuardrailTripped as e:
         metrics.record_guardrail(e.layer, e.code)
         print(f"GUARDRAIL_TRIGGERED layer={e.layer} code={e.code} detail={e.detail}")
@@ -392,6 +520,19 @@ def health():
     cfg["llm_mode"] = "real" if C.USE_REAL_LLM else "mock"
     cfg["langfuse"]["client_ready"] = obs.enabled()
     cfg["store"] = db.ping()
+
+    # 配置来源必须可见：跑「库里的配置」和跑「内置默认」行为不同，
+    # 静默用默认是最难查的一类故障——看一眼就知道比翻日志强。
+    tenant = C.DEFAULT_TENANT
+    snapshot, degraded = MS.load(tenant, None)
+    cfg["config"] = {
+        "source": "database" if (db.enabled() and snapshot.version) else "builtin",
+        "degraded": degraded,
+        "tenant": tenant,
+        "version": snapshot.version,
+    }
+    if degraded:
+        cfg["ok"] = False
     return cfg
 
 
@@ -405,6 +546,50 @@ def get_policy():
     return store.MERCHANT_POLICY
 
 
+@app.put("/api/policy")
+def update_policy(payload: dict = Body(...)):
+    """Update the merchant-facing policy used by the lightweight admin MVP."""
+    window = payload.get("return_window_days")
+    if not isinstance(window, int) or not 1 <= window <= 365:
+        raise HTTPException(status_code=422, detail="return_window_days must be 1-365")
+    rules = payload.get("rules")
+    if not isinstance(rules, dict) or not rules or any(
+            not isinstance(k, str) or not isinstance(v, str) or not v.strip()
+            for k, v in rules.items()):
+        raise HTTPException(status_code=422, detail="rules must be a non-empty text map")
+    auto = payload.get("auto_refund", {})
+    if not isinstance(auto, dict):
+        raise HTTPException(status_code=422, detail="auto_refund must be an object")
+    try:
+        minimum = float(auto.get("min_order_amount_usd", 0))
+        maximum = float(auto.get("max_order_amount_usd", 50))
+        attempts = int(auto.get("minimum_prior_attempts", 1))
+        keep_item = float(auto.get("keep_item_below_usd", 20))
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=422, detail="automatic refund values must be numeric")
+    if minimum < 0 or maximum < minimum or maximum > 500:
+        raise HTTPException(status_code=422, detail="automatic refund amount range must be between $0 and $500")
+    if not 0 <= attempts <= 3:
+        raise HTTPException(status_code=422, detail="minimum prior attempts must be between 0 and 3")
+    if keep_item < 0 or keep_item > maximum:
+        raise HTTPException(status_code=422, detail="keep-item threshold must be within the refund range")
+    store.MERCHANT_POLICY.update({
+        "return_window_days": window,
+        "rules": {k: v.strip() for k, v in rules.items()},
+        "exceptions_note": str(payload.get("exceptions_note", "")).strip(),
+        "special_rules": payload.get("special_rules", []),
+        "auto_refund": {
+            "enabled": bool(auto.get("enabled", False)),
+            "min_order_amount_usd": minimum,
+            "max_order_amount_usd": maximum,
+            "minimum_prior_attempts": attempts,
+            "keep_item_below_usd": keep_item,
+            "execution_mode": "manual_review",
+        },
+    })
+    return {"ok": True, "policy": store.MERCHANT_POLICY}
+
+
 @app.get("/api/manual-queue")
 def manual_queue():
     if db.enabled():
@@ -412,6 +597,111 @@ def manual_queue():
         return {"pending": len(rows), "source": "postgres", "tickets": rows}
     return {"pending": len(store.MANUAL_QUEUE), "source": "memory",
             "tickets": store.MANUAL_QUEUE}
+
+
+@app.get("/admin/api/dashboard")
+def admin_dashboard(range: str = Query("today", pattern="^(today|week|month)$")):
+    now = time.time()
+    span = {"today": 86400, "week": 7 * 86400, "month": 30 * 86400}[range]
+    rows = [s for s in store.all_sessions() if s.created_at >= now - span]
+    orders = [store.ORDERS[s.order_id] for s in rows if s.order_id in store.ORDERS]
+    escalated = [s for s in rows if s.outcome == "escalated"]
+    retained = [s for s in rows if s.order_id in store.ORDERS and
+                s.outcome not in ("released", "escalated", "instant_refund") and
+                s.scenario not in ("product_damage", "not_eligible", None)]
+    bucket_count = 12 if range == "today" else (7 if range == "week" else 30)
+    bucket_span = span / bucket_count
+    series = []
+    for index in range_builtin(bucket_count):
+        start = now - span + index * bucket_span
+        end = start + bucket_span
+        bucket = [s for s in rows if start <= s.created_at < end]
+        if range == "today":
+            label = time.strftime("%H:%M", time.localtime(start))
+        else:
+            label = time.strftime("%b %d", time.localtime(start))
+        series.append({"label": label, "handled": len(bucket),
+                       "retained": len([s for s in bucket if s in retained]),
+                       "escalated": len([s for s in bucket if s in escalated])})
+    durations = [max(0, s.last_activity_at - s.created_at) for s in rows]
+    costs = [s.llm_cost_usd for s in rows]
+    scenarios = {}
+    outcomes = {}
+    for s in rows:
+        scenarios[s.scenario or "unclassified"] = scenarios.get(s.scenario or "unclassified", 0) + 1
+        outcome = s.outcome or ("retained" if s in retained else "in_progress")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    return {
+        "range": range,
+        "kpis": {"agent_takeovers": len(rows), "orders_processed": len({o["order_id"] for o in orders}),
+                 "estimated_loss_saved_usd": round(sum(store.ORDERS[s.order_id]["total"] for s in retained), 2),
+                 "human_escalations": len(escalated),
+                 "avg_handle_seconds": round(sum(durations) / max(len(durations), 1)),
+                 "avg_session_cost_usd": round(sum(costs) / max(len(costs), 1), 6)},
+        "series": series, "scenarios": scenarios, "outcomes": outcomes,
+    }
+
+
+range_builtin = range
+
+
+@app.get("/admin/api/chats")
+def admin_chats(q: str = "", customer: str = "", product: str = "",
+                order_id: str = "", from_ts: int | None = None,
+                to_ts: int | None = None):
+    """Merchant-facing conversation index for the admin shell.
+
+    This intentionally stays summary-shaped: enough for list/detail management
+    UI, without exposing raw prompts or offer tokens. C3 can extend it with
+    persisted turns once the history store lands.
+    """
+    rows = [session for session in store.all_sessions() if session.messages]
+    sessions = []
+    for s in rows:
+        order = store.ORDERS.get(s.order_id or "")
+        customer_record = store.CUSTOMERS.get(s.customer_id or "")
+        item = {
+            "session_id": s.session_id,
+            "customer_id": s.customer_id,
+            "customer_name": customer_record.get("name") if customer_record else None,
+            "tenant_id": s.tenant_id,
+            "order_id": s.order_id,
+            "product": order.get("product") if order else None,
+            "stage": s.stage.value,
+            "scenario": s.scenario,
+            "outcome": s.outcome,
+            "round": s.round,
+            "turns": s.turns,
+            "emotion": round(s.emotion, 2),
+            "cost_usd": round(s.llm_cost_usd, 6),
+            "model_calls": len(s.model_calls),
+            "guardrail_trips": len(s.guardrail_trips),
+            "created_at": int(s.created_at),
+            "last_activity_at": int(s.last_activity_at),
+            "messages": s.messages,
+        }
+        haystack = " ".join([str(item.get(k) or "") for k in
+                            ("session_id", "customer_id", "customer_name", "order_id", "product")] +
+                           [m.get("text", "") for m in s.messages]).lower()
+        if q and q.lower() not in haystack:
+            continue
+        if customer and customer.lower() not in f"{item['customer_id']} {item['customer_name']}".lower():
+            continue
+        if product and product.lower() not in str(item["product"] or "").lower():
+            continue
+        if order_id and order_id.lower() not in str(item["order_id"] or "").lower():
+            continue
+        if from_ts and item["created_at"] < from_ts:
+            continue
+        if to_ts and item["created_at"] > to_ts:
+            continue
+        sessions.append(item)
+    return {
+        "source": "memory",
+        "total": len(sessions),
+        "sessions": sessions[:50],
+        "note": "Conversation history from the active session store.",
+    }
 
 
 @app.post("/api/csat")

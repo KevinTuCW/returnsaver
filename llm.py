@@ -6,6 +6,7 @@ import json
 import re
 
 import config as C
+from deps import RetentionDeps
 from models import CopyProposal, Intent, IntentResult, ModelTier, ReturnReason, Scenario
 
 
@@ -49,7 +50,7 @@ INSIST_RE = re.compile(r"just refund|only want.*refund|don'?t offer|no thanks|st
                        r"别给我|不要优惠|就要退|直接退", re.I)
 
 
-def rule_intent(text: str) -> IntentResult | None:
+def rule_intent(text: str, deps: RetentionDeps) -> IntentResult | None:
     """命中规则快路就直接返回，一次模型都不调。生产中约覆盖 60-70% 流量。"""
     reason = ReturnReason.UNKNOWN
     for pat, r in RULE_PATTERNS:
@@ -72,7 +73,7 @@ def rule_intent(text: str) -> IntentResult | None:
     has_return = bool(RETURN_INTENT_RE.search(text))
 
     # 愤怒优先：情绪过阈值绝不交给模型判——模型抖动一次就是一条差评
-    if emotion >= C.EMOTION_HARD_STOP:
+    if emotion >= deps.config.emotion_hard_stop:
         return IntentResult(intent=Intent.RETURN, reason=reason,
                             emotion=emotion, confidence=0.90)
     if has_return and reason is not ReturnReason.UNKNOWN:
@@ -117,9 +118,9 @@ INTENT_SYS = """你是电商售后意图分类器。只输出一个 JSON 对象�
 """
 
 
-def classify_intent(text: str) -> tuple[IntentResult, dict]:
+def classify_intent(text: str, deps: RetentionDeps) -> tuple[IntentResult, dict]:
     """返回 (结果, 用量元信息)。永远不为意图识别调用大模型。"""
-    fast = rule_intent(text)
+    fast = rule_intent(text, deps)
     if fast and fast.confidence >= C.INTENT_RULE_CONFIDENCE:
         return fast, {"tier": ModelTier.NONE.value, "model": "rule-fastpath",
                       "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
@@ -165,9 +166,11 @@ def classify_intent(text: str) -> tuple[IntentResult, dict]:
 
 # ════════════════════════════════════════════ 生成侧动态路由
 def route_generation(scenario: Scenario, emotion: float, order_value: float,
-                     round_no: int, customer_tier: str, spent: float) -> tuple[ModelTier, str]:
+                     round_no: int, customer_tier: str, spent: float,
+                     deps: RetentionDeps) -> tuple[ModelTier, str]:
     """决定这次回复用哪一档。返回 (档位, 理由)。"""
-    if spent >= C.CONVERSATION_COST_BUDGET_USD:
+    cfg = deps.config
+    if spent >= deps.cost_budget_usd:
         return ModelTier.NONE, "cost_budget_exhausted"
     # 婉拒是确定性内容，模板比模型更稳、更合规，且零成本。
     # **不看情绪**：只有模板分支会写 status="declined" + cited_rules，
@@ -177,9 +180,9 @@ def route_generation(scenario: Scenario, emotion: float, order_value: float,
         return ModelTier.NONE, "deterministic_template"
     if scenario is Scenario.EMOTIONAL_INSIST:
         return ModelTier.NONE, "no_retention_allowed_use_template"
-    if emotion >= C.EMOTION_LARGE_MODEL:
+    if emotion >= cfg.emotion_large_model:
         return ModelTier.LARGE, "high_emotion_needs_nuance"
-    if order_value >= C.HIGH_VALUE_ORDER_USD:
+    if order_value >= cfg.high_value_order_usd:
         return ModelTier.LARGE, "high_value_order_worth_the_spend"
     if round_no >= 2:
         return ModelTier.LARGE, "second_round_stalemate"
@@ -194,6 +197,7 @@ GEN_SYS = """你是跨境 DTC 品牌的售后助理。目标：先解决用户�
 2. message 里绝对不能出现任何金额、百分比、"无需退回"、"全额退款"之类承诺——金额由系统渲染成卡片。
 3. 先共情再给方案，2-3 句，别推销。
 4. 必须调用 propose_copy 工具作答。
+5. 必须严格使用输入 ctx.language 指定的语言回复。
 """
 
 TOOL = {
@@ -289,6 +293,15 @@ def _meta(tier: ModelTier, model: str, ti: int, to: int) -> dict:
 def mock_copy(ctx: dict, offers: list[dict]) -> dict:
     """确定性兜底：无 key / 断网 / 模型异常时行为可预测，demo 永不翻车。"""
     name = ctx.get("customer_name", "你好")
+    if ctx.get("language") == "English":
+        opening = {
+            Scenario.USAGE_ISSUE.value: f"{name}, I'm sorry the setup has been frustrating.",
+            Scenario.VALUE_GAP.value: f"{name}, I'm sorry this didn't meet your expectations.",
+            Scenario.PRODUCT_DAMAGE.value: f"{name}, receiving a damaged item is not acceptable.",
+            Scenario.NOT_ELIGIBLE.value: f"{name}, I've reviewed the circumstances of this order.",
+        }.get(ctx.get("scenario"), f"{name}, I understand the issue.")
+        return {"offer_id": offers[0]["offer_id"] if offers else "",
+                "message": f"{opening} I can offer the option below. Would that work for you?"}
     opening = {
         Scenario.USAGE_ISSUE.value: f"{name}，这个多半是设置没走通，不是机器有问题。",
         Scenario.VALUE_GAP.value: f"{name}，没达到预期确实扫兴，这单我们没提示到位。",

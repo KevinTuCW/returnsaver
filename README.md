@@ -9,7 +9,11 @@
 [![Pydantic](https://img.shields.io/badge/Pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
 [![Langfuse](https://img.shields.io/badge/Langfuse-v4%20tracing-fbbf24.svg)](#-可观测)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-optional-336791.svg?logo=postgresql&logoColor=white)](#postgresql)
+<<<<<<< HEAD
 [![tests](https://img.shields.io/badge/e2e%20tests-36%2F36-brightgreen.svg)](#-验证)
+=======
+[![tests](https://img.shields.io/badge/tests-168%20passed-brightgreen.svg)](#-验证)
+>>>>>>> feat/multitenant-config
 [![guardrails](https://img.shields.io/badge/护栏-4%20层%20L1→L4-brightgreen.svg)](#️-四层护栏)
 [![experience violations](https://img.shields.io/badge/体验不变量违反-0-brightgreen.svg)](#-体验不变量)
 [![cost](https://img.shields.io/badge/单次会话成本-0.7%25%20of%20budget-brightgreen.svg)](#-经济效率两级意图--三档生成路由)
@@ -214,10 +218,19 @@ bash demo.sh                # 12 段全流程演示，末尾会读 /tmp/rs.log �
 | `GET` | `/api/policy` | 商家售后规则原文（婉拒时引用的就是这份） |
 | `GET` | `/api/manual-queue` | 人工工单队列；接了 Postgres 时直接返回 `sla_breached` |
 | `POST` | `/api/csat?score=1..5&session_id=` | 会话结束评分，同时进本地看板与 Langfuse `user-csat` |
+| `GET` | `/admin` | 商户侧 Shopify App 风格外壳：三项主菜单，供 C1/C2/C3 挂载 |
+
 
 `/api/negotiate` 的关键入参：`session_id`（续会话）· `customer_id` · `message` · `confirm_order_id`（S3 确认）· `want_return_anyway`（体验出口，随时放弃挽留）· `force`（**仅演示护栏**：`bad_offer` / `bad_text` / `bad_amount`）。
 
 `score` 的范围必须在接口层就框死——这是个无鉴权的写接口，放一个 `99` 进来就能把 `avg_csat` 这条对外指标彻底带偏。
+
+配了 `RS_API_KEYS` 后 `/api/negotiate` 与 `/api/accept` 都要求 `X-API-Key`，**身份只来自凭证，永不来自请求体**。key 映射到 `"tenant"` 或 `"tenant:customer"`：
+
+- **租户级 key**（`"public"`）—— 服务间调用用这种。客户主体由上游（helpmate）鉴权后透传在请求体的 `customer_id` 里。
+- **客户级 key**（`"public:C-001"`）—— 只能代表那一个客户说话，请求体换成别的客户直接 **403**。
+
+会话是租户级资源：拿 B 租户的 key 续 A 租户的会话也是 **403**。
 
 ## 💬 使用示例
 
@@ -529,6 +542,8 @@ return-saver/
 ├── app.py                    # 五阶段编排 + 7 个 API + 统一出口 _ok()（补不变量字段并自检）
 ├── db/
 │   └── schema.sql            # sessions / executions（幂等唯一约束）/ manual_tickets（带 due_at）
+├── web/
+│   └── admin/                # Shopify App 风格商户后台（C）：Dashboard / Chats / Policy
 ├── docs/
 │   ├── MODEL-SELECTION.md    # GLM 三档选型实测：可用模型、能力矩阵、三个反直觉发现、成本
 │   └── GTM-PRICING.md        # 三条销售主张的口径与证明方式、三档定价、异议应对
@@ -539,6 +554,24 @@ return-saver/
 │   └── test_e2e.py           # 36 个端到端测试（流程 / 场景 / 护栏 / 体验 / 经济 / 回归）
 └── demo.sh                   # 12 段演示脚本（纯 HTTP 客户端，会等服务就绪、连不上时说人话）
 ```
+
+## 🛍️ 商户后台外壳
+
+`GET /admin` 提供 Return Saver 的商户侧后台外壳。这里的 Shopify 是交付风格要求，
+不是平台集成：暂不做 OAuth、App Bridge session token、Billing API，也不建
+`rs_shop`。商户身份仍沿用 A 阶段的 `X-API-Key → Principal` 约定。
+
+外壳包含三项主菜单：
+
+| Menu | Follow-up project | Current state |
+|---|---|---|
+| Dashboard | C2 | Implemented operational cards, routing/scenario charts, guardrail panel, and manual queue summary |
+| Chats | C3 | Implemented session list, filters, replay/audit placeholders, and `/admin/api/chats` summary data |
+| Policy | C1 | Implemented policy cards, rule list, thresholds, and dry-run/versioning placeholders |
+
+前端是零构建静态文件：`web/admin/index.html`、`app.css`、`app.js`。视觉遵循
+Polaris 的嵌入式 App 语言：左侧主导航、顶部 Page header、KPI cards、resource
+tables、font-icon menu/chart symbols、Shopify 绿色主按钮；但不依赖 Shopify 平台运行时。
 
 ## 🧩 配置
 
@@ -600,7 +633,41 @@ psql "$DATABASE_URL" -f db/schema.sql
 
 > `due_at` 不能用生成列：`timestamptz + interval` 是 STABLE 而非 IMMUTABLE，Postgres 会拒绝建表。改在 INSERT 时用 `make_interval` 算好。
 
+### 多租户与配置来源
+
+策略阈值与规则原文是**租户级**的，存在 Postgres 的 `rs_merchant_config`（append-only 版本化表），不再由 `.env` 决定。下一节那些 `RS_*` 变量现在只是**内置默认值**——库里有该租户的配置时以库为准。
+
+```bash
+RS_API_KEYS={"sk-svc":"public","sk-alice":"public:C-001"}   # 留空 = dev 模式（单租户）
+RS_DEFAULT_TENANT=public
+RS_DEFAULT_CUSTOMER=
+```
+
+三类配置：
+
+| 类别 | 谁能改 | 内容 |
+|---|---|---|
+| 商家可改 | 商家 | 10 个业务阈值 + `exceptions_note` + 4 条规则原文 |
+| 随套餐下发，商家只读 | 平台 | `plan`（`starter`/`pro`/`advanced`）· `cost_budget_usd`（0.02/0.05/0.15，天花板 0.30） |
+| 平台全局 | 平台（`.env`） | 模型/定价表/TTL/签名密钥/Langfuse/DB/holdout |
+
+**`EXPERIENCE_INVARIANTS` 完全不暴露**——五条体验不变量是平台法律，商家连关掉的入口都没有。其余商家阈值受**平台硬天花板**约束（让利上限 ≤ 50%、`emotion_hard_stop ∈ [0.5,0.9]`、`emotion_large_model < emotion_hard_stop`、谈判轮次 ≤ 3……），越界写入被拒，手插的越界行在读取时**逐字段 clamp**（一个字段填错不该让商家丢掉其余设置）。`R-DAMAGE`（破损豁免）不可停用，库层 CHECK 也拦着。
+
+**会话快照**：会话开始时钉住 `config_version`，`offer_token` 载荷带上它，L4 按**签发时那一版**复核上限。所以商家中途调低让利上限，不会否掉系统已经承诺给客户的方案——但也不是免检，超过签发那一版的上限照样拦。
+
+建表与 seed：
+
+```bash
+psql "$DATABASE_URL" -f db/schema.sql                        # 会话/幂等/工单三张表
+psql "$DATABASE_URL" -f db/migrations/001_multitenant_config.sql  # 五张 rs_ 表 + seed v1
+psql "$DATABASE_URL" -f db/migrations/002_demo_fixtures.sql   # 演示数据，生产不跑
+```
+
+零配置仍然成立：没有库或 `RS_STORE_BACKEND=memory` 时走内置默认配置，hermetic 测试与离线演示不受影响。`/health` 的 `config.source` 会如实报 `builtin` 还是 `database`。
+
 ### 策略与体验阈值
+
+> 以下默认值在接了库之后只是**内置兜底**，租户的实际取值来自 `rs_merchant_config`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -629,6 +696,7 @@ psql "$DATABASE_URL" -f db/schema.sql
 - ✅ PostgreSQL 三张表落库（会话 / 执行幂等 / 人工工单），memory 模式下完全 no-op
 - ✅ 36 个 e2e（含 Code Review 修掉的 8 个问题的回归用例）+ `verify_live.py` 真实链路验证
 - ✅ 双口径挽留率 + 强制 holdout 分桶（SHA-256，跨进程稳定，有子进程测试兜底）
+- ✅ Shopify App 风格商户后台（C）：`/admin` 按 Dashboard / Chats / Policy 顺序提供三项管理界面
 - ⬜ **流式输出**（首字延迟压到 1–2s）—— `glm-4.6` 跨次实测 9.7–13.5s，逼近甚至超出 12s 预算，MVP 之后第一优先级
 - ⬜ `load_session` 接回读路径，重启后从库恢复会话而非从内存重建
 - ⬜ `MODEL_PRICING` 换成厂商合同价（当前是量级占位值）

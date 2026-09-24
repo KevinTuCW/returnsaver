@@ -90,13 +90,37 @@ def test_scenario_value_gap_offers_compensation():
     assert r["offer"]["value"] <= 100.0 * C.MAX_DISCOUNT_PCT
 
 
+def test_order_confirmation_keeps_the_previous_return_intent():
+    first_status, first = neg(customer_id="C-001", message="The shirt is too small")
+    assert first_status == 200
+    assert first["status"] == "awaiting_order_confirmation"
+
+    status, confirmed = neg(session_id=first["session_id"], customer_id="C-001",
+                            message="Yes, ORD-1001", confirm_order_id="ORD-1001")
+
+    assert status == 200
+    assert confirmed["status"] == "offer_made"
+    assert confirmed["scenario"] == "value_gap"
+
+
+def test_english_customer_receives_english_replies_through_confirmation():
+    _, first = neg(customer_id="C-001", message="The shirt is too small and I want to return it")
+    assert first["reply"].startswith("To make sure")
+    assert not any("\u4e00" <= char <= "\u9fff" for char in first["reply"])
+
+    _, confirmed = neg(session_id=first["session_id"], customer_id="C-001",
+                       message="Yes, ORD-1001", confirm_order_id="ORD-1001")
+    assert not any("\u4e00" <= char <= "\u9fff" for char in confirmed["reply"])
+    assert confirmed["offer"]["label"].startswith("Free size exchange")
+
+
 def test_scenario_product_damage_offers_repair_or_exchange():
     """场景④：破损 → 修理/换货，且不受窗口限制。"""
     _, r = full("C-002", "ORD-1002", "The mug arrived cracked")
     assert r["scenario"] == "product_damage"
     assert r["action"] == "offer_repair_exchange"
     labels = [r["offer"]["label"]] + [a["label"] for a in r["alternatives"]]
-    assert any("换新" in x or "维修" in x for x in labels)
+    assert any("exchange" in x.lower() or "repair" in x.lower() for x in labels)
 
 
 def test_scenario_emotional_small_amount_instant_refund():
@@ -380,15 +404,17 @@ def test_csat_rejects_out_of_range_scores():
 def test_used_item_blocks_only_no_reason_returns():
     """R-USED 原文是"不支持无理由退货"：使用类问题必须先用过才会发现，
     尺码试穿也不算明显使用，拿这条挡人会踩体验红线。"""
+    import deps as D
     import policy
     from models import ReturnReason as RR
     from store import ORDERS
+    d = D.build_default()
     used = ORDERS["ORD-1004"]      # used=True，窗口内
     assert used["used"] is True
-    assert policy.check_eligibility(used, RR.USAGE)["eligible"]
-    assert policy.check_eligibility(used, RR.SIZE_FIT)["eligible"]
-    assert policy.check_eligibility(used, RR.DAMAGED)["eligible"]
-    blocked = policy.check_eligibility(used, RR.CHANGED_MIND)
+    assert policy.check_eligibility(used, RR.USAGE, d)["eligible"]
+    assert policy.check_eligibility(used, RR.SIZE_FIT, d)["eligible"]
+    assert policy.check_eligibility(used, RR.DAMAGED, d)["eligible"]
+    blocked = policy.check_eligibility(used, RR.CHANGED_MIND, d)
     assert not blocked["eligible"]
     assert any(code == "R-USED" for code, _ in blocked["violated"])
 

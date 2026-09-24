@@ -28,6 +28,29 @@ PORT = _i("RS_PORT", 8777)
 SIGNING_KEY = os.getenv("RS_SIGNING_KEY", "dev-only-not-a-real-secret").encode()
 if ENV == "prod" and SIGNING_KEY == b"dev-only-not-a-real-secret":
     raise RuntimeError("生产环境必须设置 RS_SIGNING_KEY（openssl rand -hex 32）")
+DEFAULT_TENANT = os.getenv("RS_DEFAULT_TENANT", "public")
+DEFAULT_CUSTOMER = os.getenv("RS_DEFAULT_CUSTOMER", "")
+
+
+def _json_env(key: str) -> dict:
+    """RS_API_KEYS 是 JSON。解析失败要响：静默变空 dict 等于静默关掉鉴权，
+    而「没配 key」在 auth.py 里的语义正好是「dev 模式，谁来都算默认租户」。
+    一个手抖的逗号不该把生产打开成单租户裸奔。"""
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return {}
+    import json
+    try:
+        val = json.loads(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{key} 不是合法 JSON：{e}") from e
+    if not isinstance(val, dict):
+        raise RuntimeError(f"{key} 必须是 JSON 对象")
+    return val
+
+
+# key -> "tenant" 或 "tenant:customer"；留空 = dev 模式（见 auth.py）
+API_KEYS: dict = _json_env("RS_API_KEYS")
 
 # ──────────────────────────────────────────── LLM 接入（OpenAI 兼容端点，默认智谱 GLM）
 LLM_BASE_URL = (os.getenv("RS_LLM_BASE_URL") or os.getenv("GLM_BASE_URL")
@@ -130,6 +153,9 @@ def summary() -> dict:
     """/health 用。绝不返回任何密钥本身，只报是否配置。"""
     return {
         "env": ENV,
+        # 只报是否配置与条数，绝不回显任何 key 本身
+        "auth": {"configured": bool(API_KEYS), "key_count": len(API_KEYS),
+                 "default_tenant": DEFAULT_TENANT},
         "llm": {"configured": USE_REAL_LLM, "base_url": LLM_BASE_URL,
                 "intent": MODEL_INTENT, "small": MODEL_SMALL, "large": MODEL_LARGE},
         "langfuse": {"enabled": USE_LANGFUSE, "base_url": LANGFUSE_BASE_URL,

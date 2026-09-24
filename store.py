@@ -13,13 +13,21 @@ MERCHANT_POLICY = {
     "merchant_id": "M-DEMO",
     "return_window_days": 30,
     "rules": {
-        "R-WINDOW": "自签收之日起 30 天内可申请退货，逾期不再受理。",
-        "R-FINAL": "标记为 Final Sale 的清仓商品不支持退换。",
-        "R-HYGIENE": "内衣、泳装等贴身类目一经拆封，出于卫生考虑不支持退货。",
-        "R-USED": "商品需保持未使用、吊牌完整状态；已明显使用的不支持无理由退货。",
-        "R-DAMAGE": "商品到货破损或发错，不受上述限制，可直接换货或退款。",
+        "R-WINDOW": "Returns are accepted within 30 days of delivery.",
+        "R-FINAL": "Items marked Final Sale are not eligible for return or exchange.",
+        "R-HYGIENE": "Opened intimate apparel and swimwear cannot be returned for hygiene reasons.",
+        "R-USED": "Items must be unused and retain all original tags to qualify for a discretionary return.",
+        "R-DAMAGE": "Damaged or incorrectly shipped items qualify for replacement or refund regardless of the standard restrictions.",
     },
-    "exceptions_note": "质量问题与物流破损不受窗口与拆封限制，随时受理。",
+    "exceptions_note": "Quality issues and shipping damage are exempt from the return window and opened-item restrictions.",
+    "auto_refund": {
+        "enabled": False,
+        "min_order_amount_usd": 0.0,
+        "max_order_amount_usd": 50.0,
+        "minimum_prior_attempts": 1,
+        "keep_item_below_usd": 20.0,
+        "execution_mode": "manual_review",
+    },
 }
 
 # ──────────────────────────────────────────── Mock 数据：覆盖全部五个场景
@@ -38,6 +46,12 @@ CUSTOMERS = {
               "lifetime_orders": 8, "returns_last_90d": 0, "risk_flag": False},
     "C-007": {"customer_id": "C-007", "name": "Alex", "tier": "normal",
               "lifetime_orders": 20, "returns_last_90d": 6, "risk_flag": True},  # 薅羊毛
+    "C-008": {"customer_id": "C-008", "name": "Maya", "tier": "normal",
+              "lifetime_orders": 5, "returns_last_90d": 0, "risk_flag": False},
+    "C-009": {"customer_id": "C-009", "name": "Jordan", "tier": "vip",
+              "lifetime_orders": 14, "returns_last_90d": 1, "risk_flag": False},
+    "C-010": {"customer_id": "C-010", "name": "Leo", "tier": "normal",
+              "lifetime_orders": 3, "returns_last_90d": 0, "risk_flag": False},
 }
 
 ORDERS = {
@@ -105,6 +119,30 @@ ORDERS = {
         "sizes_in_stock": ["M", "L"], "repairable": False,
         "negotiations_last_90d": 4, "has_manual": True,
     },
+    "ORD-1009": {
+        "order_id": "ORD-1009", "customer_id": "C-008", "sku": "BAG-TOTE-01",
+        "product": "Canvas Everyday Tote", "category": "accessories",
+        "total": 72.00, "gross_margin_pct": 0.62, "days_since_delivery": 8,
+        "final_sale": False, "opened": True, "used": False,
+        "sizes_in_stock": [], "repairable": False,
+        "negotiations_last_90d": 0, "has_manual": True,
+    },
+    "ORD-1010": {
+        "order_id": "ORD-1010", "customer_id": "C-009", "sku": "KTL-ELC-01",
+        "product": "Smart Temperature Kettle", "category": "home",
+        "total": 128.00, "gross_margin_pct": 0.48, "days_since_delivery": 4,
+        "final_sale": False, "opened": True, "used": True,
+        "sizes_in_stock": [], "repairable": True,
+        "negotiations_last_90d": 0, "has_manual": True,
+    },
+    "ORD-1011": {
+        "order_id": "ORD-1011", "customer_id": "C-010", "sku": "SNK-WALK-43",
+        "product": "City Walker Sneakers (43)", "category": "footwear",
+        "total": 115.00, "gross_margin_pct": 0.57, "days_since_delivery": 5,
+        "final_sale": False, "opened": True, "used": False,
+        "sizes_in_stock": ["42", "44"], "repairable": False,
+        "negotiations_last_90d": 0, "has_manual": True,
+    },
 }
 
 # 使用类问题的知识库（USAGE_ISSUE 场景走这里，命中即可零 LLM 成本回答）
@@ -143,6 +181,10 @@ KNOWLEDGE_BASE = {
 class Session:
     session_id: str
     customer_id: str | None = None
+    tenant_id: str = "public"
+    # 会话开始时钉住的配置版本，0 = 内置默认。钉住了就不再变：商家中途改配置
+    # 不该让同一段对话前后两轮按不同规则结算。
+    config_version: int = 0
     order_id: str | None = None
     stage: Stage = Stage.INTENT
     round: int = 0      # 已发出的挽留轮次
@@ -156,7 +198,10 @@ class Session:
     guardrail_trips: list[dict] = field(default_factory=list)
     candidate_orders: list[str] = field(default_factory=list)
     outcome: str | None = None
+    language: str = "zh"
     created_at: float = field(default_factory=time.time)
+    last_activity_at: float = field(default_factory=time.time)
+    messages: list[dict] = field(default_factory=list)
 
 
 SESSIONS: dict[str, Session] = {}
@@ -164,8 +209,10 @@ EXECUTED: dict[str, dict] = {}        # 幂等表
 MANUAL_QUEUE: list[dict] = []         # 人工介入工单
 
 
-def new_session(customer_id: str | None) -> Session:
-    s = Session(session_id=f"S-{uuid.uuid4().hex[:12]}", customer_id=customer_id)
+def new_session(customer_id: str | None, tenant_id: str = "public",
+                config_version: int = 0) -> Session:
+    s = Session(session_id=f"S-{uuid.uuid4().hex[:12]}", customer_id=customer_id,
+                tenant_id=tenant_id, config_version=config_version)
     SESSIONS[s.session_id] = s
     return s
 
@@ -178,7 +225,52 @@ def persist(s: Session) -> None:
 
 
 def get_session(session_id: str | None) -> Session | None:
-    return SESSIONS.get(session_id) if session_id else None
+    if not session_id:
+        return None
+    session = SESSIONS.get(session_id)
+    if session is not None:
+        return session
+    import db
+    row = db.load_session(session_id)
+    if not row:
+        return None
+    session = session_from_row(row)
+    SESSIONS[session.session_id] = session
+    return session
+
+
+def session_from_row(row: dict) -> Session:
+    def timestamp(value, fallback: float) -> float:
+        return value.timestamp() if hasattr(value, "timestamp") else fallback
+
+    now = time.time()
+    return Session(
+        session_id=row["session_id"], customer_id=row.get("customer_id"),
+        tenant_id=row.get("tenant_id") or "public",
+        config_version=int(row.get("config_version") or 0),
+        order_id=row.get("order_id"), stage=Stage(row["stage"]),
+        round=int(row.get("round") or 0), turns=int(row.get("turns") or 0),
+        intent=row.get("intent"), reason=row.get("reason"),
+        emotion=float(row.get("emotion") or 0), scenario=row.get("scenario"),
+        llm_cost_usd=float(row.get("llm_cost_usd") or 0),
+        model_calls=list(row.get("model_calls") or []),
+        guardrail_trips=list(row.get("guardrail_trips") or []),
+        outcome=row.get("outcome"), language=row.get("language") or "zh",
+        created_at=timestamp(row.get("created_at"), now),
+        last_activity_at=timestamp(row.get("last_activity_at"), now),
+        messages=list(row.get("messages") or []),
+    )
+
+
+def all_sessions(tenant_id: str | None = None) -> list[Session]:
+    import db
+    merged = dict(SESSIONS)
+    for row in db.list_sessions(tenant_id=tenant_id):
+        merged.setdefault(row["session_id"], session_from_row(row))
+    rows = list(merged.values())
+    if tenant_id:
+        rows = [s for s in rows if s.tenant_id == tenant_id]
+    return sorted(rows, key=lambda s: s.created_at, reverse=True)
 
 
 def orders_of(customer_id: str) -> list[dict]:
