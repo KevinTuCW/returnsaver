@@ -186,7 +186,8 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
 
 def _manual_review(session: store.Session, order: dict, *, sla_hours: int,
                    anomalies: list[str], priority: str = "P2",
-                   cited_rules: list[tuple[str, str]] | None = None) -> dict:
+                   cited_rules: list[tuple[str, str]] | None = None,
+                   customer_note: str | None = None) -> dict:
     """Create at most one open review for a conversation and order.
 
     Conversation can continue after handoff; the business side effect cannot be
@@ -231,10 +232,12 @@ def _manual_review(session: store.Session, order: dict, *, sla_hours: int,
 
     session.stage = Stage.EXECUTE
     session.outcome = "escalated"
-    reply = (f"I have sent this request to a specialist for review. You will "
+    reply = (customer_note if session.language == "en" and customer_note else
+             f"I have sent this request to a specialist for review. You will "
              f"receive an update within {sla_hours} hours. Your case number is "
              f"{existing['ticket_id']}, and your return window is paused while "
              "we review it." if session.language == "en" else
+             customer_note if customer_note else
              f"这单已经转给售后专员复核，{sla_hours} 小时内会给你明确答复。"
              f"工单号 {existing['ticket_id']}，复核期间退货窗口已暂停计算。")
     return _ok(session, {
@@ -381,6 +384,22 @@ def _negotiate(req: NegotiateRequest, session: store.Session,
     scenario = policy.classify_scenario(order, reason, session.emotion, elig, deps)
     session.scenario = scenario.value
 
+    special_rules = policy.matching_special_rules(
+        order, scenario, deps.policy_extras.get("special_rules", []))
+    if special_rules:
+        cited = [(f"SPECIAL-{i + 1}", rule["rule"].strip())
+                 for i, rule in enumerate(special_rules)]
+        note = ("I found a product-specific service policy and have asked a specialist "
+                "to check the best option for you. You will hear back within "
+                f"{deps.config.manual_sla_hours} hours; your return window is protected."
+                if session.language == "en" else
+                "我查到这件商品适用专属售后规则，已请专员结合你的情况核实合适的处理方式。"
+                f"{deps.config.manual_sla_hours} 小时内会回复你，等待期间退货时限会为你保留。")
+        return _manual_review(
+            session, order, sla_hours=deps.config.manual_sla_hours,
+            anomalies=["special_rule_match"], cited_rules=cited,
+            customer_note=note)
+
     # An ineligible return is a policy decision, not an automatic approval.
     # Escalate once so a specialist can consider evidence and exceptions while
     # the customer remains free to continue the conversation.
@@ -466,8 +485,8 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
     if scenario is Scenario.NOT_ELIGIBLE:
         cited = [{"code": c, "text": t} for c, t in pl["violated"]]
         alt = offers[0] if offers else None
-        reply = ("我核对了一下，这单确实不符合退货条件，原因写在下面，你可以自己核对。"
-                 "但不能就这么算了——下面这个方案你看行不行。")
+        reply = ("我理解你是想退掉这件商品。我核对了适用规则，具体原因列在下面；"
+                 "同时也准备了一个替代方案，你可以看看是否适合。")
         p = {"status": "declined", "scenario": scenario.value, "action": action.value,
              "reply": reply, "cited_rules": cited, "policy_note": pl["policy_note"],
              "offer": alt, "next_action": "await_customer_decision"}
@@ -477,8 +496,18 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
         return _ok(session, p, allow_retention)
 
     alt = offers[0] if offers else None
+    openings = {
+        Scenario.USAGE_ISSUE: "听起来这个设置过程确实有些麻烦，我们可以先一起把问题排查清楚。",
+        Scenario.VALUE_GAP: "理解，商品和预期不太一致确实会让人失望。",
+        Scenario.PRODUCT_DAMAGE: "很抱歉商品到货时有问题，这确实影响了你的体验。",
+    }
+    reply = openings.get(scenario, "谢谢你告诉我具体情况，我来看看怎样处理更合适。")
+    if scenario is Scenario.USAGE_ISSUE:
+        reply += "我可以先提供下面的指导；如果你仍想退货，也可以直接告诉我。"
+    else:
+        reply += "我整理了下面这个选项，你可以考虑；不合适的话也完全没关系。"
     p = {"status": "offer_made", "scenario": scenario.value, "action": action.value,
-         "reply": "我先给你一个方案，你看合不合适。", "offer": alt,
+         "reply": reply, "offer": alt,
          "next_action": "await_customer_decision"}
     if alt:
         p["offer_token"] = G.issue_offer_token(
@@ -709,12 +738,16 @@ def update_policy(payload: dict = Body(...),
     if keep_item < 0 or keep_item > maximum:
         raise HTTPException(status_code=422, detail="keep-item threshold must be within the refund range")
     special_rules = payload.get("special_rules", [])
+    allowed_scopes = {"Product", "Category", "Scenario"}
     if not isinstance(special_rules, list) or any(
             not isinstance(item, dict) or not str(item.get("scope", "")).strip()
+            or item.get("scope") not in allowed_scopes
             or not str(item.get("match", "")).strip()
             or not str(item.get("rule", "")).strip()
             for item in special_rules):
-        raise HTTPException(status_code=422, detail="special_rules must be complete objects")
+        raise HTTPException(status_code=422, detail=(
+            "special_rules need a Product, Category, or Scenario scope, a match value, "
+            "and a rule description"))
 
     current, _ = MS.load(principal.tenant_id, None)
     fields = current.as_fields()

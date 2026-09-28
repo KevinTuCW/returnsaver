@@ -79,6 +79,28 @@ def classify_scenario(order: dict, reason: ReturnReason, emotion: float,
     return Scenario.VALUE_GAP     # 尺码/价格/不想要，统一走价值补偿线
 
 
+def matching_special_rules(order: dict, scenario: Scenario,
+                           rules: list[dict]) -> list[dict]:
+    """Match merchant rules by exact product/SKU, category, or scenario.
+
+    A match requests specialist review. Free-text rule descriptions are never
+    interpreted as executable refund instructions.
+    """
+    values = {
+        "product": {str(order.get("product", "")).strip().casefold(),
+                    str(order.get("sku", "")).strip().casefold()},
+        "category": {str(order.get("category", "")).strip().casefold()},
+        "scenario": {scenario.value.casefold()},
+    }
+    matches = []
+    for rule in rules:
+        scope = str(rule.get("scope", "")).strip().casefold()
+        match = str(rule.get("match", "")).strip().casefold()
+        if scope in values and match and match in values[scope]:
+            matches.append(rule)
+    return matches
+
+
 # ──────────────────────────────────────────── 分级退款（要求 3 第五类）
 def triage_refund(order: dict, customer: dict, eligibility: dict,
                   deps: RetentionDeps, round_no: int = 0) -> tuple[Action, dict]:

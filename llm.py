@@ -195,9 +195,11 @@ GEN_SYS = """你是跨境 DTC 品牌的售后助理。目标：先解决用户�
 硬规则：
 1. 只能从 allowed_offers 里选一个 offer_id，不得创造新方案。
 2. message 里绝对不能出现任何金额、百分比、"无需退回"、"全额退款"之类承诺——金额由系统渲染成卡片。
-3. 先共情再给方案，2-3 句，别推销。
-4. 必须调用 propose_copy 工具作答。
-5. 必须严格使用输入 ctx.language 指定的语言回复。
+3. 用自然、柔和、尊重的语气回应。先针对用户刚才说的具体困扰表达理解，再说明一个最相关的帮助或方案。
+4. 简洁说人话，不要客服腔、夸张道歉、责怪用户或重复复述整段消息；避免“但不能就这么算了”等施压措辞。
+5. 只问推进处理所必需的问题。用户已经明确拒绝挽留时，不再劝说；接受退货是正常选择。
+6. 通常用 2-3 句。必须调用 propose_copy 工具作答。
+7. 必须严格使用输入 ctx.language 指定的语言回复。
 """
 
 TOOL = {
@@ -295,18 +297,24 @@ def mock_copy(ctx: dict, offers: list[dict]) -> dict:
     name = ctx.get("customer_name", "你好")
     if ctx.get("language") == "English":
         opening = {
-            Scenario.USAGE_ISSUE.value: f"{name}, I'm sorry the setup has been frustrating.",
-            Scenario.VALUE_GAP.value: f"{name}, I'm sorry this didn't meet your expectations.",
-            Scenario.PRODUCT_DAMAGE.value: f"{name}, receiving a damaged item is not acceptable.",
-            Scenario.NOT_ELIGIBLE.value: f"{name}, I've reviewed the circumstances of this order.",
-        }.get(ctx.get("scenario"), f"{name}, I understand the issue.")
+            Scenario.USAGE_ISSUE.value: f"{name}, I can see how frustrating it is when setup doesn't go smoothly.",
+            Scenario.VALUE_GAP.value: f"{name}, I understand this wasn't quite what you expected.",
+            Scenario.PRODUCT_DAMAGE.value: f"{name}, I'm sorry the item arrived damaged; that isn't the experience you should have had.",
+            Scenario.NOT_ELIGIBLE.value: f"{name}, I understand you'd like to return this, and I've checked the policy that applies.",
+        }.get(ctx.get("scenario"), f"{name}, thanks for explaining what happened.")
+        offer_line = ("I can walk you through a few setup steps, if you'd find that helpful."
+                      if ctx.get("scenario") == Scenario.USAGE_ISSUE.value else
+                      "There's an option below if it feels right for you; returning it is still your choice.")
         return {"offer_id": offers[0]["offer_id"] if offers else "",
-                "message": f"{opening} I can offer the option below. Would that work for you?"}
+                "message": f"{opening} {offer_line}"}
     opening = {
-        Scenario.USAGE_ISSUE.value: f"{name}，这个多半是设置没走通，不是机器有问题。",
-        Scenario.VALUE_GAP.value: f"{name}，没达到预期确实扫兴，这单我们没提示到位。",
-        Scenario.PRODUCT_DAMAGE.value: f"{name}，到货就是坏的，这是我们的责任。",
-        Scenario.NOT_ELIGIBLE.value: f"{name}，这单的情况我核对了一下，有点特殊。",
-    }.get(ctx.get("scenario"), f"{name}，我看到你的问题了。")
+        Scenario.USAGE_ISSUE.value: f"{name}，设置没顺利完成确实挺让人着急的。",
+        Scenario.VALUE_GAP.value: f"{name}，我理解商品和预期不太一致会让人失望。",
+        Scenario.PRODUCT_DAMAGE.value: f"{name}，很抱歉商品到货时有损坏，这影响了你的体验。",
+        Scenario.NOT_ELIGIBLE.value: f"{name}，我理解你想退货，也仔细核对了这单适用的规则。",
+    }.get(ctx.get("scenario"), f"{name}，谢谢你把情况告诉我。")
+    offer_line = ("如果你愿意，我可以先陪你排查一下使用问题。"
+                  if ctx.get("scenario") == Scenario.USAGE_ISSUE.value else
+                  "我整理了下面这个选项供你考虑；如果不合适，按你的想法退货也没问题。")
     return {"offer_id": offers[0]["offer_id"] if offers else "",
-            "message": f"{opening}我这边可以先给你一个方案，你看合不合适？"}
+            "message": f"{opening}{offer_line}"}
