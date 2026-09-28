@@ -65,7 +65,8 @@ def scan_output_text(text: str, approved_values: set[str]) -> None:
 
 
 # ════════════════════════════════════════════ L4 执行层隔离
-def issue_offer_token(order_id: str, offer: dict, deps: RetentionDeps) -> str:
+def issue_offer_token(order_id: str, offer: dict, deps: RetentionDeps,
+                      *, session_id: str) -> str:
     """签发兑付凭证。cfg_v 让 L4 能按**签发时那一版**复核上限。
 
     没有 cfg_v 的话：商家在 TTL 内把上限从 30% 调到 10%，L4 会否掉系统自己
@@ -73,6 +74,7 @@ def issue_offer_token(order_id: str, offer: dict, deps: RetentionDeps) -> str:
     """
     payload = {"order_id": order_id, "offer_id": offer["offer_id"],
                "value": float(offer["value"]),
+               "tenant_id": deps.tenant_id, "session_id": session_id,
                "cfg_v": int(deps.config_version),
                "exp": int(time.time()) + C.OFFER_TOKEN_TTL,
                "jti": uuid.uuid4().hex}

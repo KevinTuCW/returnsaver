@@ -63,11 +63,8 @@ def _exec(sql: str, params: tuple = ()) -> None:
     pool = _get_pool()
     if pool is None:
         return
-    try:
-        with pool.connection() as conn:
-            conn.execute(sql, params)
-    except Exception as e:
-        print(f"DB_WRITE_FAILED {type(e).__name__}: {e}")
+    with pool.connection() as conn:
+        conn.execute(sql, params)
 
 
 def _query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
@@ -137,46 +134,117 @@ def list_sessions(tenant_id: str | None = None, limit: int = 500) -> list[dict]:
 
 
 # ──────────────────────────────────────────── 执行幂等
-def record_execution(key: str, order_id: str, offer_id: str, value: float,
-                     session_id: str | None = None) -> None:
-    if not enabled():
-        return
-    _exec("""INSERT INTO executions (idempotency_key, order_id, offer_id, value, session_id)
-             VALUES (%s,%s,%s,%s,%s) ON CONFLICT (idempotency_key) DO NOTHING""",
-          (key, order_id, offer_id, value, session_id))
+def execute_once(*, tenant_id: str, key: str, token_jti: str, order_id: str,
+                 offer_id: str, value: float, session_id: str | None,
+                 outcome: str) -> tuple[bool, dict]:
+    """Atomically record a business execution and its conversation outcome."""
+    pool = _get_pool()
+    if pool is None:
+        raise RuntimeError("database unavailable")
+    from psycopg.rows import dict_row
+    with pool.connection() as conn, conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """INSERT INTO executions
+                   (tenant_id, idempotency_key, token_jti, order_id, offer_id,
+                    value, session_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT DO NOTHING RETURNING *""",
+                (tenant_id, key, token_jti, order_id, offer_id, value, session_id))
+            row = cur.fetchone()
+            created = row is not None
+            if not created:
+                cur.execute(
+                    """SELECT * FROM executions
+                       WHERE tenant_id=%s AND idempotency_key=%s""",
+                    (tenant_id, key))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        """SELECT * FROM executions
+                           WHERE tenant_id=%s AND token_jti=%s""",
+                        (tenant_id, token_jti))
+                    row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError("execution conflict could not be resolved")
+            if created and session_id:
+                cur.execute(
+                    """UPDATE sessions SET outcome=%s, stage='S5_execute',
+                       updated_at=now() WHERE session_id=%s AND tenant_id=%s""",
+                    (outcome, session_id, tenant_id))
+            return created, dict(row)
 
 
-def get_execution(key: str) -> dict | None:
+def get_execution(tenant_id: str, key: str) -> dict | None:
     if not enabled():
         return None
-    rows = _query("SELECT * FROM executions WHERE idempotency_key=%s", (key,))
+    rows = _query("""SELECT * FROM executions
+                     WHERE tenant_id=%s AND idempotency_key=%s""",
+                  (tenant_id, key))
     return rows[0] if rows else None
 
 
-# ──────────────────────────────────────────── 人工工单
-def enqueue_ticket(t: dict, customer_id: str | None = None,
-                   session_id: str | None = None) -> None:
+def list_executions(tenant_id: str, since_epoch: float) -> list[dict]:
     if not enabled():
-        return
-    _exec("""INSERT INTO manual_tickets
-             (ticket_id, session_id, order_id, customer_id, priority,
-              sla_hours, amount, anomalies, due_at)
-             VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
-                     now() + make_interval(hours => %s))
-             ON CONFLICT (ticket_id) DO NOTHING""",
-          (t["ticket_id"], session_id, t["order_id"], customer_id, t["priority"],
-           t["sla_hours"], t["amount"], json.dumps(t.get("anomalies", [])),
-           t["sla_hours"]))
+        return []
+    return _query(
+        """SELECT order_id, offer_id, value, session_id, executed_at
+           FROM executions WHERE tenant_id=%s AND executed_at >= to_timestamp(%s)
+           ORDER BY executed_at""", (tenant_id, since_epoch))
 
 
-def open_tickets() -> list[dict]:
+# ──────────────────────────────────────────── 人工工单
+def get_open_ticket(tenant_id: str, session_id: str, order_id: str) -> dict | None:
+    if not enabled():
+        return None
+    rows = _query(
+        """SELECT * FROM manual_tickets WHERE tenant_id=%s AND session_id=%s
+           AND order_id=%s AND status <> 'resolved' ORDER BY created_at LIMIT 1""",
+        (tenant_id, session_id, order_id))
+    return dict(rows[0]) if rows else None
+
+
+def enqueue_ticket(t: dict, *, tenant_id: str, customer_id: str | None = None,
+                   session_id: str | None = None) -> dict:
+    if not C.USE_POSTGRES:
+        return t
+    pool = _get_pool()
+    if pool is None:
+        raise RuntimeError("database unavailable")
+    from psycopg.rows import dict_row
+    with pool.connection() as conn, conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """INSERT INTO manual_tickets
+                   (ticket_id, tenant_id, session_id, order_id, customer_id,
+                    priority, sla_hours, amount, anomalies, due_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
+                           now() + make_interval(hours => %s))
+                   ON CONFLICT DO NOTHING RETURNING *""",
+                (t["ticket_id"], tenant_id, session_id, t["order_id"], customer_id,
+                 t["priority"], t["sla_hours"], t["amount"],
+                 json.dumps(t.get("anomalies", [])), t["sla_hours"]))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """SELECT * FROM manual_tickets
+                       WHERE tenant_id=%s AND session_id=%s AND order_id=%s
+                       AND status <> 'resolved' ORDER BY created_at LIMIT 1""",
+                    (tenant_id, session_id, t["order_id"]))
+                row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("ticket conflict could not be resolved")
+            return dict(row)
+
+
+def open_tickets(tenant_id: str) -> list[dict]:
     if not enabled():
         return []
     return _query("""SELECT ticket_id, order_id, priority, sla_hours, amount,
                             status, created_at, due_at,
                             (due_at < now()) AS sla_breached
-                     FROM manual_tickets WHERE status <> 'resolved'
-                     ORDER BY due_at ASC""")
+                     FROM manual_tickets WHERE tenant_id=%s AND status <> 'resolved'
+                     ORDER BY due_at ASC""", (tenant_id,))
 
 
 # ──────────────────────────────────────────── 商家配置
@@ -258,7 +326,23 @@ def insert_merchant_config(tenant_id: str, fields: dict, *, created_by: str,
                        (tenant_id, version, code, text, enabled)
                        VALUES (%s,%s,%s,%s,%s)""",
                     (tenant_id, version, code, text, code not in disabled))
+            conn.execute(
+                """INSERT INTO rs_policy_extras
+                   (tenant_id, version, special_rules, auto_refund)
+                   VALUES (%s,%s,%s::jsonb,%s::jsonb)""",
+                (tenant_id, version,
+                 json.dumps(fields.get("special_rules", []), ensure_ascii=False),
+                 json.dumps(fields.get("auto_refund", {}), ensure_ascii=False)))
     return version
+
+
+def fetch_policy_extras(tenant_id: str, version: int) -> dict:
+    if not enabled():
+        return {}
+    rows = _query(
+        """SELECT special_rules, auto_refund FROM rs_policy_extras
+           WHERE tenant_id=%s AND version=%s""", (tenant_id, version))
+    return dict(rows[0]) if rows else {}
 
 
 # ──────────────────────────────────────────── 订单 / 客户属性

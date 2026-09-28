@@ -20,7 +20,8 @@ def _deps(cap: float, version: int) -> D.RetentionDeps:
 
 def test_token_carries_config_version():
     d = _deps(0.30, 7)
-    tok = G.issue_offer_token("ORD-1001", {"offer_id": "X", "value": 10.0}, d)
+    tok = G.issue_offer_token("ORD-1001", {"offer_id": "X", "value": 10.0}, d,
+                              session_id="S-test")
     raw_hex, _, _sig = tok.partition(".")
     payload = json.loads(bytes.fromhex(raw_hex))
     assert payload["cfg_v"] == 7
@@ -50,7 +51,8 @@ def test_token_signed_under_v1_still_redeems_after_v2_lowers_cap():
     d1 = dataclasses.replace(D.build_default(), config=v1, config_version=1)
     # $25 在 v1 的 30% 内、在 v2 的 10% 外
     tok = G.issue_offer_token("ORD-1001", {"offer_id": "CREDIT_25",
-                                           "value": 25.0}, d1)
+                                           "value": 25.0}, d1,
+                              session_id="S-test")
 
     payload = G.verify_offer_token(
         tok,
@@ -64,7 +66,8 @@ def test_token_still_capped_by_its_own_version():
     """跨版本豁免不是免检：超过签发那一版的上限照样拦。"""
     v1 = dataclasses.replace(M.BUILTIN_DEFAULT, max_discount_pct=0.30, version=1)
     d1 = dataclasses.replace(D.build_default(), config=v1, config_version=1)
-    tok = G.issue_offer_token("ORD-1001", {"offer_id": "X", "value": 40.0}, d1)
+    tok = G.issue_offer_token("ORD-1001", {"offer_id": "X", "value": 40.0}, d1,
+                              session_id="S-test")
     with pytest.raises(G.GuardrailTripped) as e:
         G.verify_offer_token(
             tok,

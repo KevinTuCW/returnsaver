@@ -81,7 +81,7 @@ def classify_scenario(order: dict, reason: ReturnReason, emotion: float,
 
 # ──────────────────────────────────────────── 分级退款（要求 3 第五类）
 def triage_refund(order: dict, customer: dict, eligibility: dict,
-                  deps: RetentionDeps) -> tuple[Action, dict]:
+                  deps: RetentionDeps, round_no: int = 0) -> tuple[Action, dict]:
     """情绪激烈执意要退：小额立即退，大额或异常人工介入。
     人工介入必须给明确时效承诺——这是体验钩子，不是拖延。"""
     cfg = deps.config
@@ -96,11 +96,23 @@ def triage_refund(order: dict, customer: dict, eligibility: dict,
     if not eligibility["eligible"]:
         anomalies.append("not_eligible")
 
-    if order["total"] <= cfg.instant_refund_cap_usd and not anomalies:
+    auto = deps.policy_extras.get("auto_refund") or None
+    if auto is None:
+        auto_qualified = order["total"] <= cfg.instant_refund_cap_usd
+        keep_item_below = 20.0
+    else:
+        auto_qualified = (
+            bool(auto.get("enabled"))
+            and float(auto.get("min_order_amount_usd", 0)) <= order["total"]
+            <= float(auto.get("max_order_amount_usd", cfg.instant_refund_cap_usd))
+            and round_no >= int(auto.get("minimum_prior_attempts", 0)))
+        keep_item_below = float(auto.get("keep_item_below_usd", 20))
+
+    if auto_qualified and not anomalies:
         return Action.INSTANT_REFUND, {
             "refund_amount": order["total"],
             "eta": "即时到账，银行入账 1-3 个工作日",
-            "keep_item": order["total"] <= 20,   # 极小额免退回，逆向物流不划算
+            "keep_item": order["total"] <= keep_item_below,
         }
     return Action.ESCALATE_HUMAN, {
         "sla_hours": cfg.manual_sla_hours,
@@ -178,7 +190,7 @@ def build_resolution(order: dict, customer: dict, scenario: Scenario,
                 "payload": {"tier_pct": tier}, "allow_retention": True}
 
     # EMOTIONAL_INSIST：分级处理，且**禁止任何挽留话术**
-    action, payload = triage_refund(order, customer, eligibility, deps)
+    action, payload = triage_refund(order, customer, eligibility, deps, round_no)
     if not eligibility["eligible"]:
         # 转人工时把违反的规则一起带过去，人工才知道为什么不能直接退
         payload["violated"] = eligibility["violated"]

@@ -10,9 +10,26 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 os.environ["RS_LLM_API_KEY"] = ""
 os.environ["GLM_API_KEY"] = ""
 os.environ["LANGFUSE_PUBLIC_KEY"] = ""
 os.environ["LANGFUSE_SECRET_KEY"] = ""
 os.environ["RS_STORE_BACKEND"] = "memory"
 os.environ["RS_HOLDOUT_PCT"] = "0"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_in_memory_state():
+    """Each test gets a clean process-local store, like a fresh request suite."""
+    import merchant_store
+    import store
+
+    store.SESSIONS.clear()
+    store.EXECUTED.clear()
+    store.MANUAL_QUEUE.clear()
+    store.POLICY_EXTRAS.clear()
+    merchant_store._MEMORY_CONFIGS.clear()
+    merchant_store.cache_clear()
+    yield

@@ -1,4 +1,6 @@
 -- 001 — 多租户化与配置下沉（非破坏式）。
+\set ON_ERROR_STOP on
+BEGIN;
 --
 -- 前置：先应用 db/schema.sql（建 sessions / executions / manual_tickets）。
 --   psql "$DATABASE_URL" -f db/schema.sql
@@ -81,8 +83,7 @@ CREATE TABLE IF NOT EXISTS rs_tenant (
 -- delivered_at 而不是 days_since_delivery：数据库里存"距今多少天"的整数
 -- 第二天就是错的。mock 能蒙过去只因为它从不持久化。
 CREATE TABLE IF NOT EXISTS rs_order_attrs (
-    order_id              TEXT    PRIMARY KEY
-        REFERENCES orders (order_id) ON DELETE CASCADE,
+    order_id              TEXT    PRIMARY KEY,
     sku                   TEXT,
     -- 商品展示名。helpmate 的 orders 没有这一列（它只有 customer 姓名），而挽留
     -- 话术要说出商品名（"Merino Crew Tee 穿起来偏小"）。属于本服务的扩展字段，
@@ -99,6 +100,25 @@ CREATE TABLE IF NOT EXISTS rs_order_attrs (
     negotiations_last_90d INT     NOT NULL DEFAULT 0,
     has_manual            BOOLEAN NOT NULL DEFAULT false
 );
+
+-- Helpmate and Return Saver may share a database, but Return Saver also supports
+-- a standalone database with mock/catalog adapters. Add the ownership FK only
+-- when the upstream orders table exists; rerunning this migration later will
+-- install it once Helpmate has been migrated into the same database.
+DO $$
+BEGIN
+    IF to_regclass('orders') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_constraint
+           WHERE conname = 'rs_order_attrs_order_id_fkey'
+             AND conrelid = 'rs_order_attrs'::regclass) THEN
+        ALTER TABLE rs_order_attrs
+            ADD CONSTRAINT rs_order_attrs_order_id_fkey
+            FOREIGN KEY (order_id) REFERENCES orders (order_id) ON DELETE CASCADE;
+    ELSIF to_regclass('orders') IS NULL THEN
+        RAISE NOTICE 'orders table not found; rs_order_attrs created without optional Helpmate FK';
+    END IF;
+END $$;
 
 -- 对已建表的库补列（CREATE TABLE IF NOT EXISTS 不会改已有表结构）
 ALTER TABLE rs_order_attrs ADD COLUMN IF NOT EXISTS product TEXT;
@@ -130,16 +150,16 @@ INSERT INTO rs_merchant_config (
     max_session_turns, abuse_negotiation_limit, exceptions_note,
     created_by, note)
 VALUES ('public', 1, 30, 0.300, 50.00, 2, 0.70, 0.45, 200.00, 2, 8, 3,
-        '质量问题与物流破损不受窗口与拆封限制，随时受理。',
+        'Quality issues and shipping damage are exempt from the return window and opened-item restrictions.',
         'migration', '从 store.MERCHANT_POLICY 迁移')
 ON CONFLICT (tenant_id, version) DO NOTHING;
 
 INSERT INTO rs_merchant_rule (tenant_id, version, code, text) VALUES
-  ('public', 1, 'R-WINDOW',  '自签收之日起 30 天内可申请退货，逾期不再受理。'),
-  ('public', 1, 'R-FINAL',   '标记为 Final Sale 的清仓商品不支持退换。'),
-  ('public', 1, 'R-HYGIENE', '内衣、泳装等贴身类目一经拆封，出于卫生考虑不支持退货。'),
-  ('public', 1, 'R-USED',    '商品需保持未使用、吊牌完整状态；已明显使用的不支持无理由退货。'),
-  ('public', 1, 'R-DAMAGE',  '商品到货破损或发错，不受上述限制，可直接换货或退款。')
+  ('public', 1, 'R-WINDOW',  'Returns are accepted within 30 days of delivery.'),
+  ('public', 1, 'R-FINAL',   'Items marked Final Sale are not eligible for return or exchange.'),
+  ('public', 1, 'R-HYGIENE', 'Opened intimate apparel and swimwear cannot be returned for hygiene reasons.'),
+  ('public', 1, 'R-USED',    'Items must be unused and retain all original tags to qualify for a discretionary return.'),
+  ('public', 1, 'R-DAMAGE',  'Damaged or incorrectly shipped items qualify for replacement or refund regardless of the standard restrictions.')
 ON CONFLICT (tenant_id, version, code) DO NOTHING;
 
 -- ───────────────────────────── sessions 追加租户与钉住的版本
@@ -157,3 +177,5 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id      TEXT NOT NULL DEFAU
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS config_version INT  NOT NULL DEFAULT 0;
 -- C2（Dashboard 按租户按日聚合）要靠这个索引
 CREATE INDEX IF NOT EXISTS sessions_tenant_idx ON sessions (tenant_id, created_at DESC);
+
+COMMIT;

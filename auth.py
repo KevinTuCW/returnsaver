@@ -15,12 +15,18 @@ dev 模式是本地便利，不是鉴权绕过——下游的归属校验两种�
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Query
 
 import config as C
+
+TENANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -68,3 +74,36 @@ def require_principal(x_api_key: Optional[str] = Header(default=None)) -> Princi
     if p is None:
         raise HTTPException(status_code=401, detail="missing or invalid API key")
     return p
+
+
+def _valid_tenant(value: str) -> str:
+    if not TENANT_RE.fullmatch(value):
+        raise HTTPException(status_code=422, detail="invalid tenant_id")
+    return value
+
+
+def admin_signature(tenant_id: str, expires: int) -> str:
+    """Sign a tenant-scoped Admin URL without exposing an API key."""
+    message = f"admin:{tenant_id}:{expires}".encode()
+    return hmac.new(C.SIGNING_KEY, message, hashlib.sha256).hexdigest()
+
+
+def require_admin_tenant(
+        tenant_id: str = Query(default=C.DEFAULT_TENANT),
+        expires: int | None = Query(default=None),
+        sig: str | None = Query(default=None)) -> Principal:
+    """Resolve Admin tenant context from a signed URL.
+
+    The default tenant remains frictionless only in keyless local development.
+    Every other context needs an expiring signature, so a tenant id never acts
+    as an authentication credential by itself.
+    """
+    tenant_id = _valid_tenant(tenant_id)
+    local_default = not _api_keys() and tenant_id == C.DEFAULT_TENANT
+    if not local_default:
+        if expires is None or sig is None or expires < int(time.time()):
+            raise HTTPException(status_code=401, detail="missing or expired admin URL signature")
+        expected = admin_signature(tenant_id, expires)
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(status_code=403, detail="invalid admin URL signature")
+    return Principal(tenant_id=tenant_id, dev_mode=local_default)

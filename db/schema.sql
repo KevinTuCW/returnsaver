@@ -32,13 +32,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_scenario  ON sessions (scenario);
 
 -- 幂等表：同一个 idempotency_key 只允许执行一次
 CREATE TABLE IF NOT EXISTS executions (
-    idempotency_key TEXT PRIMARY KEY,
+    tenant_id      TEXT        NOT NULL DEFAULT 'public',
+    idempotency_key TEXT       NOT NULL,
+    token_jti       TEXT       NOT NULL,
     order_id        TEXT        NOT NULL,
     offer_id        TEXT        NOT NULL,
     value           NUMERIC(12,2) NOT NULL,
     session_id      TEXT,
     executed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT value_non_negative CHECK (value >= 0)
+    CONSTRAINT value_non_negative CHECK (value >= 0),
+    UNIQUE (tenant_id, idempotency_key),
+    UNIQUE (tenant_id, token_jti)
 );
 
 CREATE INDEX IF NOT EXISTS idx_executions_order ON executions (order_id);
@@ -46,6 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_executions_order ON executions (order_id);
 -- 人工介入工单
 CREATE TABLE IF NOT EXISTS manual_tickets (
     ticket_id   TEXT PRIMARY KEY,
+    tenant_id   TEXT        NOT NULL DEFAULT 'public',
     session_id  TEXT,
     order_id    TEXT        NOT NULL,
     customer_id TEXT,
@@ -64,3 +69,6 @@ CREATE TABLE IF NOT EXISTS manual_tickets (
 -- SLA 看板靠这个索引：按到期时间捞还没处理的工单
 CREATE INDEX IF NOT EXISTS idx_tickets_open_due
     ON manual_tickets (due_at) WHERE status <> 'resolved';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_one_open_case
+    ON manual_tickets (tenant_id, session_id, order_id)
+    WHERE status <> 'resolved';

@@ -15,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from auth import Principal, require_principal
+from auth import Principal, require_admin_tenant, require_principal
 import config as C
 import db
 import deps as D
@@ -184,6 +184,69 @@ def _release(session: store.Session, reply: str, reason: str) -> dict:
                          "release_reason": reason, "next_action": "standard_return"})
 
 
+def _manual_review(session: store.Session, order: dict, *, sla_hours: int,
+                   anomalies: list[str], priority: str = "P2",
+                   cited_rules: list[tuple[str, str]] | None = None) -> dict:
+    """Create at most one open review for a conversation and order.
+
+    Conversation can continue after handoff; the business side effect cannot be
+    duplicated by retries or by a customer returning later.
+    """
+    existing = next((t for t in store.MANUAL_QUEUE
+                     if t.get("tenant_id") == session.tenant_id
+                     and t.get("session_id") == session.session_id
+                     and t.get("order_id") == order["order_id"]
+                     and t.get("status", "open") != "resolved"), None)
+    if existing is None:
+        existing = db.get_open_ticket(session.tenant_id, session.session_id,
+                                      order["order_id"])
+    if existing is None:
+        existing = {
+            "ticket_id": f"T-{int(time.time())}-{uuid.uuid4().hex[:6]}",
+            "tenant_id": session.tenant_id,
+            "session_id": session.session_id,
+            "order_id": order["order_id"],
+            "priority": priority,
+            "sla_hours": sla_hours,
+            "anomalies": anomalies,
+            "amount": order["total"],
+            "created_at": int(time.time()),
+            "status": "open",
+        }
+        if cited_rules:
+            existing["cited_rules"] = [
+                {"code": code, "text": text} for code, text in cited_rules]
+        try:
+            existing = db.enqueue_ticket(
+                existing, tenant_id=session.tenant_id,
+                customer_id=session.customer_id, session_id=session.session_id)
+        except Exception as e:
+            print(f"TICKET_TRANSACTION_FAILED {type(e).__name__}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="manual review could not be committed; retry safely")
+        if not any(t.get("ticket_id") == existing["ticket_id"]
+                   for t in store.MANUAL_QUEUE):
+            store.MANUAL_QUEUE.append(existing)
+
+    session.stage = Stage.EXECUTE
+    session.outcome = "escalated"
+    reply = (f"I have sent this request to a specialist for review. You will "
+             f"receive an update within {sla_hours} hours. Your case number is "
+             f"{existing['ticket_id']}, and your return window is paused while "
+             "we review it." if session.language == "en" else
+             f"这单已经转给售后专员复核，{sla_hours} 小时内会给你明确答复。"
+             f"工单号 {existing['ticket_id']}，复核期间退货窗口已暂停计算。")
+    return _ok(session, {
+        "status": "escalated", "scenario": session.scenario,
+        "action": Action.ESCALATE_HUMAN.value, "reply": reply,
+        "ticket": existing,
+        "cited_rules": existing.get("cited_rules", []),
+        "guarantee": {"return_window_frozen": True, "sla_hours": sla_hours},
+        "offer": None, "next_action": "human_review",
+    }, allow_retention=False)
+
+
 # ════════════════════════════════════════════ 主入口
 @app.post("/api/negotiate")
 def negotiate(req: NegotiateRequest,
@@ -318,6 +381,14 @@ def _negotiate(req: NegotiateRequest, session: store.Session,
     scenario = policy.classify_scenario(order, reason, session.emotion, elig, deps)
     session.scenario = scenario.value
 
+    # An ineligible return is a policy decision, not an automatic approval.
+    # Escalate once so a specialist can consider evidence and exceptions while
+    # the customer remains free to continue the conversation.
+    if scenario is Scenario.NOT_ELIGIBLE:
+        return _manual_review(
+            session, order, sla_hours=deps.config.manual_sla_hours,
+            anomalies=["not_eligible"], cited_rules=elig["violated"])
+
     # 情绪激烈场景：不生成任何挽留话术，直接分级执行（不消耗谈判额度）
     if scenario is Scenario.EMOTIONAL_INSIST:
         res = policy.build_resolution(order, customer, scenario, elig, session.round, deps)
@@ -374,7 +445,8 @@ def _negotiate(req: NegotiateRequest, session: store.Session,
         "status": "offer_made", "scenario": scenario.value, "action": action.value,
         "reply": proposal.message,
         "offer": {**offer},
-        "offer_token": G.issue_offer_token(order_id, offer, deps),
+        "offer_token": G.issue_offer_token(order_id, offer, deps,
+                                           session_id=session.session_id),
         "alternatives": [{"offer_id": o["offer_id"], "label": o["label"]}
                          for o in offers if o["offer_id"] != offer["offer_id"]],
         "next_action": "await_customer_decision",
@@ -400,7 +472,8 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
              "reply": reply, "cited_rules": cited, "policy_note": pl["policy_note"],
              "offer": alt, "next_action": "await_customer_decision"}
         if alt:
-            p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
+            p["offer_token"] = G.issue_offer_token(
+                order["order_id"], alt, deps, session_id=session.session_id)
         return _ok(session, p, allow_retention)
 
     alt = offers[0] if offers else None
@@ -408,17 +481,40 @@ def _template_reply(session: store.Session, order: dict, scenario: Scenario,
          "reply": "我先给你一个方案，你看合不合适。", "offer": alt,
          "next_action": "await_customer_decision"}
     if alt:
-        p["offer_token"] = G.issue_offer_token(order["order_id"], alt, deps)
+        p["offer_token"] = G.issue_offer_token(
+            order["order_id"], alt, deps, session_id=session.session_id)
     return _ok(session, p, allow_retention)
 
 
 # ════════════════════════════════════════════ 情绪激烈：分级处理
 def _emotional(session: store.Session, order: dict, action: Action, pl: dict) -> dict:
-    session.stage = Stage.CLOSED
+    session.stage = Stage.EXECUTE
     metrics.record_conversation(session.session_id, Scenario.EMOTIONAL_INSIST.value,
                                 action.value, session.llm_cost_usd,
                                 [m["tier"] for m in session.model_calls])
     if action is Action.INSTANT_REFUND:
+        execution_key = f"instant-refund:{session.session_id}:{order['order_id']}"
+        memory_key = (session.tenant_id, execution_key)
+        if memory_key not in store.EXECUTED:
+            executed_at = int(time.time())
+            result = {"order_id": order["order_id"], "offer_id": "INSTANT_REFUND",
+                      "value": pl["refund_amount"],
+                      "session_id": session.session_id,
+                      "executed_at": executed_at}
+            try:
+                if C.USE_POSTGRES:
+                    _, row = db.execute_once(
+                        tenant_id=session.tenant_id, key=execution_key,
+                        token_jti=execution_key, order_id=order["order_id"],
+                        offer_id="INSTANT_REFUND", value=pl["refund_amount"],
+                        session_id=session.session_id, outcome="instant_refund")
+                    result["executed_at"] = int(row["executed_at"].timestamp())
+            except Exception as e:
+                print(f"REFUND_TRANSACTION_FAILED {type(e).__name__}: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="refund could not be committed; retry safely")
+            store.EXECUTED[memory_key] = result
         session.outcome = "instant_refund"
         keep = pl.get("keep_item")
         reply = ("不跟你绕了，退款我已经直接发起，" + pl["eta"] + "。"
@@ -433,30 +529,10 @@ def _emotional(session: store.Session, order: dict, action: Action, pl: dict) ->
                                 "note": "退款完成后自动发放，90 天有效——把差体验变成下次再来的理由"},
             "offer": None, "next_action": "refund_issued"}, allow_retention=False)
 
-    # 大额 / 异常 → 人工介入，但必须给死时效
-    session.outcome = "escalated"
-    # ticket_id 必须带随机尾巴：只用秒级时间戳的话，同一秒内两次升级会撞 id，
-    # 而入库是 ON CONFLICT (ticket_id) DO NOTHING —— 第二张工单会被静默丢掉
-    ticket = {"ticket_id": f"T-{int(time.time())}-{uuid.uuid4().hex[:6]}",
-              "order_id": order["order_id"],
-              "priority": pl["priority"], "sla_hours": pl["sla_hours"],
-              "anomalies": pl["anomalies"], "amount": order["total"],
-              "created_at": int(time.time())}
-    if pl.get("violated"):
-        # 不合规却因情绪转人工：把违反的规则带上，人工才知道为什么不能直接退
-        ticket["cited_rules"] = [{"code": c, "text": t} for c, t in pl["violated"]]
-    store.MANUAL_QUEUE.append(ticket)
-    db.enqueue_ticket(ticket, customer_id=session.customer_id,
-                      session_id=session.session_id)
-    reply = (f"这单金额比较大，我不想让机器替你做决定。已经转给专人，"
-             f"{pl['sla_hours']} 小时内一定给你答复，工单号 {ticket['ticket_id']}。"
-             f"在那之前退货权益不受影响，窗口我已经帮你冻结。")
-    return _ok(session, {
-        "status": "escalated", "scenario": Scenario.EMOTIONAL_INSIST.value,
-        "action": action.value, "reply": reply, "ticket": ticket,
-        "guarantee": {"return_window_frozen": True,
-                      "sla_hours": pl["sla_hours"]},
-        "offer": None, "next_action": "human_takeover"}, allow_retention=False)
+    return _manual_review(
+        session, order, sla_hours=pl["sla_hours"],
+        anomalies=pl["anomalies"], priority=pl["priority"],
+        cited_rules=pl.get("violated"))
 
 
 # ════════════════════════════════════════════ L4 执行层
@@ -475,16 +551,15 @@ def _accept_get_order(principal: Principal):
 @app.post("/api/accept")
 def accept(req: AcceptRequest,
            principal: Principal = Depends(require_principal)):
-    if req.idempotency_key in store.EXECUTED:
-        return {"status": "already_executed", **store.EXECUTED[req.idempotency_key]}
-    # 内存幂等表活不过重启，光靠它会在重启后对同一个 key 二次执行 = 二次发钱。
-    # 落了库就必须回库里问一次，这是 L4 唯一真正防重放的地方。
-    prior = db.get_execution(req.idempotency_key)
+    memory_key = (principal.tenant_id, req.idempotency_key)
+    if memory_key in store.EXECUTED:
+        return {"status": "already_executed", **store.EXECUTED[memory_key]}
+    prior = db.get_execution(principal.tenant_id, req.idempotency_key)
     if prior is not None:
         result = {"order_id": prior["order_id"], "offer_id": prior["offer_id"],
                   "value": float(prior["value"]),
                   "executed_at": int(prior["executed_at"].timestamp())}
-        store.EXECUTED[req.idempotency_key] = result      # 回填，后续重放不再查库
+        store.EXECUTED[memory_key] = result
         return {"status": "already_executed", **result}
     try:
         payload = G.verify_offer_token(
@@ -503,12 +578,52 @@ def accept(req: AcceptRequest,
             "guardrail": {"layer": e.layer, "code": e.code, "detail": e.detail},
             "reply": "这个方案已经失效了，我重新给你出一个。",
             "next_action": "reissue_offer"})
+    if payload.get("tenant_id") != principal.tenant_id:
+        raise HTTPException(status_code=403, detail="offer belongs to another tenant")
+    session_id = payload.get("session_id")
+    session = store.get_session(session_id)
+    if not session or session.tenant_id != principal.tenant_id:
+        raise HTTPException(status_code=409, detail="offer session is unavailable")
+
     result = {"order_id": payload["order_id"], "offer_id": payload["offer_id"],
-              "value": payload["value"], "executed_at": int(time.time())}
-    store.EXECUTED[req.idempotency_key] = result
-    db.record_execution(req.idempotency_key, payload["order_id"],
-                        payload["offer_id"], payload["value"])
-    return {"status": "executed", **result}
+              "value": payload["value"], "session_id": session_id,
+              "executed_at": int(time.time())}
+    jti_key = (principal.tenant_id, f"jti:{payload['jti']}")
+    prior_jti = store.EXECUTED.get(jti_key)
+    if prior_jti:
+        store.EXECUTED[memory_key] = prior_jti
+        return {"status": "already_executed", **prior_jti}
+
+    try:
+        if C.USE_POSTGRES:
+            created, row = db.execute_once(
+                tenant_id=principal.tenant_id, key=req.idempotency_key,
+                token_jti=payload["jti"], order_id=payload["order_id"],
+                offer_id=payload["offer_id"], value=payload["value"],
+                session_id=session_id, outcome="retained")
+            result = {
+                "order_id": row["order_id"], "offer_id": row["offer_id"],
+                "value": float(row["value"]), "session_id": row.get("session_id"),
+                "executed_at": int(row["executed_at"].timestamp()),
+            }
+        else:
+            created = True
+    except Exception as e:
+        print(f"EXECUTION_TRANSACTION_FAILED {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503,
+                            detail="execution could not be committed; retry safely")
+
+    store.EXECUTED[memory_key] = result
+    store.EXECUTED[jti_key] = result
+    if created:
+        session.stage = Stage.EXECUTE
+        session.outcome = "retained"
+        session.messages.append({
+            "role": "system", "text": f"Offer {payload['offer_id']} accepted and executed.",
+            "at": int(time.time()), "event": "offer_executed"})
+        session.last_activity_at = time.time()
+        store.persist(session)
+    return {"status": "executed" if created else "already_executed", **result}
 
 
 # ════════════════════════════════════════════ 运维 / 看板
@@ -537,18 +652,38 @@ def health():
 
 
 @app.get("/api/metrics")
-def get_metrics():
+def get_metrics(_: Principal = Depends(require_admin_tenant)):
     return metrics.snapshot()
 
 
 @app.get("/api/policy")
-def get_policy():
-    return store.MERCHANT_POLICY
+def get_policy(principal: Principal = Depends(require_admin_tenant)):
+    cfg, degraded = MS.load(principal.tenant_id, None)
+    if cfg.version == 0:
+        rules = dict(store.MERCHANT_POLICY["rules"])
+        note = store.MERCHANT_POLICY["exceptions_note"]
+    else:
+        rules = dict(cfg.rules)
+        note = cfg.exceptions_note
+    extras = (db.fetch_policy_extras(principal.tenant_id, cfg.version)
+              if db.enabled() and cfg.version else
+              store.POLICY_EXTRAS.get(principal.tenant_id, {}))
+    return {
+        "tenant_id": principal.tenant_id, "version": cfg.version,
+        "degraded": degraded, "return_window_days": cfg.return_window_days,
+        "rules": rules, "exceptions_note": note,
+        "special_rules": extras.get("special_rules", []),
+        "auto_refund": extras.get("auto_refund", {
+            **store.MERCHANT_POLICY["auto_refund"],
+            "max_order_amount_usd": cfg.instant_refund_cap_usd,
+        }),
+    }
 
 
 @app.put("/api/policy")
-def update_policy(payload: dict = Body(...)):
-    """Update the merchant-facing policy used by the lightweight admin MVP."""
+def update_policy(payload: dict = Body(...),
+                  principal: Principal = Depends(require_admin_tenant)):
+    """Validate and publish the tenant's actual versioned decision policy."""
     window = payload.get("return_window_days")
     if not isinstance(window, int) or not 1 <= window <= 365:
         raise HTTPException(status_code=422, detail="return_window_days must be 1-365")
@@ -573,42 +708,77 @@ def update_policy(payload: dict = Body(...)):
         raise HTTPException(status_code=422, detail="minimum prior attempts must be between 0 and 3")
     if keep_item < 0 or keep_item > maximum:
         raise HTTPException(status_code=422, detail="keep-item threshold must be within the refund range")
-    store.MERCHANT_POLICY.update({
+    special_rules = payload.get("special_rules", [])
+    if not isinstance(special_rules, list) or any(
+            not isinstance(item, dict) or not str(item.get("scope", "")).strip()
+            or not str(item.get("match", "")).strip()
+            or not str(item.get("rule", "")).strip()
+            for item in special_rules):
+        raise HTTPException(status_code=422, detail="special_rules must be complete objects")
+
+    current, _ = MS.load(principal.tenant_id, None)
+    fields = current.as_fields()
+    fields.update({
         "return_window_days": window,
-        "rules": {k: v.strip() for k, v in rules.items()},
+        "instant_refund_cap_usd": maximum,
+        "rules": {**dict(current.rules), **{k: v.strip() for k, v in rules.items()}},
         "exceptions_note": str(payload.get("exceptions_note", "")).strip(),
-        "special_rules": payload.get("special_rules", []),
-        "auto_refund": {
-            "enabled": bool(auto.get("enabled", False)),
-            "min_order_amount_usd": minimum,
-            "max_order_amount_usd": maximum,
-            "minimum_prior_attempts": attempts,
-            "keep_item_below_usd": keep_item,
-            "execution_mode": "manual_review",
-        },
     })
-    return {"ok": True, "policy": store.MERCHANT_POLICY}
+    fields["disabled_rules"] = [
+        code for code in fields["disabled_rules"] if code not in fields["rules"]]
+    auto_policy = {
+        "enabled": bool(auto.get("enabled", False)),
+        "min_order_amount_usd": minimum,
+        "max_order_amount_usd": maximum,
+        "minimum_prior_attempts": attempts,
+        "keep_item_below_usd": keep_item,
+        "execution_mode": "automatic_when_qualified",
+    }
+    fields["special_rules"] = special_rules
+    fields["auto_refund"] = auto_policy
+    try:
+        version = MS.save(principal.tenant_id, fields,
+                          created_by="admin-url", note="Published from Admin Policy")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    store.POLICY_EXTRAS[principal.tenant_id] = {
+        "special_rules": special_rules,
+        "auto_refund": auto_policy,
+    }
+    return {"ok": True, "version": version,
+            "policy": get_policy(principal)}
 
 
 @app.get("/api/manual-queue")
-def manual_queue():
+def manual_queue(principal: Principal = Depends(require_admin_tenant)):
     if db.enabled():
-        rows = db.open_tickets()
+        rows = db.open_tickets(principal.tenant_id)
         return {"pending": len(rows), "source": "postgres", "tickets": rows}
-    return {"pending": len(store.MANUAL_QUEUE), "source": "memory",
-            "tickets": store.MANUAL_QUEUE}
+    rows = [t for t in store.MANUAL_QUEUE
+            if t.get("tenant_id") == principal.tenant_id]
+    return {"pending": len(rows), "source": "memory", "tickets": rows}
+
+
+def _active_handle_seconds(session: store.Session) -> float:
+    """Conversation work time excluding customer-away gaps over five minutes."""
+    timestamps = sorted(
+        float(message["at"]) for message in session.messages
+        if isinstance(message.get("at"), (int, float)))
+    return sum(min(max(current - previous, 0), 300)
+               for previous, current in zip(timestamps, timestamps[1:]))
 
 
 @app.get("/admin/api/dashboard")
-def admin_dashboard(range: str = Query("today", pattern="^(today|week|month)$")):
+def admin_dashboard(range: str = Query("today", pattern="^(today|week|month)$"),
+                    principal: Principal = Depends(require_admin_tenant)):
     now = time.time()
     span = {"today": 86400, "week": 7 * 86400, "month": 30 * 86400}[range]
-    rows = [s for s in store.all_sessions() if s.created_at >= now - span]
+    rows = [s for s in store.all_sessions(principal.tenant_id)
+            if s.created_at >= now - span]
     orders = [store.ORDERS[s.order_id] for s in rows if s.order_id in store.ORDERS]
     escalated = [s for s in rows if s.outcome == "escalated"]
-    retained = [s for s in rows if s.order_id in store.ORDERS and
-                s.outcome not in ("released", "escalated", "instant_refund") and
-                s.scenario not in ("product_damage", "not_eligible", None)]
+    retained = [s for s in rows if s.order_id in store.ORDERS
+                and s.outcome == "retained"]
     bucket_count = 12 if range == "today" else (7 if range == "week" else 30)
     bucket_span = span / bucket_count
     series = []
@@ -623,8 +793,30 @@ def admin_dashboard(range: str = Query("today", pattern="^(today|week|month)$"))
         series.append({"label": label, "handled": len(bucket),
                        "retained": len([s for s in bucket if s in retained]),
                        "escalated": len([s for s in bucket if s in escalated])})
-    durations = [max(0, s.last_activity_at - s.created_at) for s in rows]
+    durations = [_active_handle_seconds(s) for s in rows]
     costs = [s.llm_cost_usd for s in rows]
+    if db.enabled():
+        executions = db.list_executions(principal.tenant_id, now - span)
+    else:
+        executions = list({
+            (value.get("order_id"), value.get("offer_id"), value.get("executed_at")): value
+            for value in store.EXECUTED.values()
+            if value.get("executed_at", 0) >= now - span
+        }.values())
+    retained_order_ids = {
+        execution.get("order_id") for execution in executions
+        if execution.get("offer_id") != "INSTANT_REFUND"
+    }
+    # This KPI is deliberately an estimate: include executed retention actions
+    # plus unresolved, addressable offers, but count each order only once. Older
+    # dashboards summed sessions and could count the same order several times.
+    retained_order_ids.update(
+        s.order_id for s in rows
+        if s.order_id and s.outcome is None
+        and s.scenario in (Scenario.VALUE_GAP.value, Scenario.USAGE_ISSUE.value))
+    estimated_saved = sum(
+        store.ORDERS[order_id]["total"] for order_id in retained_order_ids
+        if order_id in store.ORDERS)
     scenarios = {}
     outcomes = {}
     for s in rows:
@@ -634,7 +826,7 @@ def admin_dashboard(range: str = Query("today", pattern="^(today|week|month)$"))
     return {
         "range": range,
         "kpis": {"agent_takeovers": len(rows), "orders_processed": len({o["order_id"] for o in orders}),
-                 "estimated_loss_saved_usd": round(sum(store.ORDERS[s.order_id]["total"] for s in retained), 2),
+                 "estimated_loss_saved_usd": round(estimated_saved, 2),
                  "human_escalations": len(escalated),
                  "avg_handle_seconds": round(sum(durations) / max(len(durations), 1)),
                  "avg_session_cost_usd": round(sum(costs) / max(len(costs), 1), 6)},
@@ -648,14 +840,16 @@ range_builtin = range
 @app.get("/admin/api/chats")
 def admin_chats(q: str = "", customer: str = "", product: str = "",
                 order_id: str = "", from_ts: int | None = None,
-                to_ts: int | None = None):
+                to_ts: int | None = None,
+                principal: Principal = Depends(require_admin_tenant)):
     """Merchant-facing conversation index for the admin shell.
 
     This intentionally stays summary-shaped: enough for list/detail management
     UI, without exposing raw prompts or offer tokens. C3 can extend it with
     persisted turns once the history store lands.
     """
-    rows = [session for session in store.all_sessions() if session.messages]
+    rows = [session for session in store.all_sessions(principal.tenant_id)
+            if session.messages]
     sessions = []
     for s in rows:
         order = store.ORDERS.get(s.order_id or "")

@@ -76,7 +76,7 @@ Helpmate 内嵌 Return Saver，客户可以确认订单、查看挽留方案并�
 - 📐 **双口径挽留率** —— `/api/metrics` 同时上报 `addressable_deflection_rate`（主口径，分母已排除破损/错发/超窗口）与 `overall_deflection_rate`（全量），防止销售话术和 QBR 打架。分母是**会话**不是轮次。
 - 🧪 **强制 holdout 对照组** —— `RS_HOLDOUT_PCT=10` 做增量归因，60 天结算窗口。分桶走 `session_id` 的 SHA-256 摘要，不用内建 `hash()`——后者每进程带随机种子，换 worker 就换实验臂，归因直接作废。
 - 🔭 **Langfuse 全链路 + 四类分数** —— 一次 `/api/negotiate` 一个 span，`session_id` 串起整段对话；`user-csat` / `guardrail-trip` / `experience-violation` / `retention-outcome` 四个分数按**信号来源**命名。
-- 💾 **持久化关键业务状态** —— 会话、执行幂等、人工工单、租户规则及 Admin 历史数据均可落 PostgreSQL；不可用时降级到内存。
+- 💾 **持久化关键业务状态** —— 会话、执行幂等、人工工单、租户规则及 Admin 历史数据均可落 PostgreSQL；一旦配置数据库，资金与工单写入故障时 fail closed。
 
 ## 🏗️ 架构
 
@@ -389,7 +389,14 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com   # US 区 us.cloud / 自托管填�
 
 ## 🛍️ 商户后台
 
-`GET /admin` 提供英文版 Shopify Admin 风格界面。当前不依赖 Shopify OAuth、App Bridge 或 Billing API，商户身份沿用 `X-API-Key → Principal`。
+`GET /admin` 提供英文版 Shopify Admin 风格界面。当前不依赖 Shopify OAuth、App Bridge 或 Billing API。默认租户在无 API key 的本地开发环境可直接打开；其他租户使用带有效期 HMAC 签名的 URL，`tenant_id` 只负责选择租户，不能单独充当凭证：
+
+```bash
+.venv/bin/python scripts/admin_url.py merchant-a
+# http://localhost:8777/admin?tenant_id=merchant-a&expires=...&sig=...
+```
+
+前端会把 `tenant_id`、`expires` 和 `sig` 自动带到 Dashboard、Chats、Policy 及工单请求。后端再次验签并按租户过滤数据。
 
 | Menu | 能力 |
 |---|---|
@@ -455,7 +462,7 @@ psql "$DATABASE_URL" -f db/schema.sql
 | `executions` | **重复发钱**（幂等键唯一约束兜底） |
 | `manual_tickets` | 违反 SLA 承诺（带 `due_at`，`/api/manual-queue` 直接算 `sla_breached`） |
 
-PostgreSQL 启用后负责会话恢复、跨重启幂等和 Admin 历史记录；不可用时主流程降级到内存，`/health` 会报告连接状态。
+PostgreSQL 启用后负责会话恢复、跨重启幂等和 Admin 历史记录。未配置 PostgreSQL 时可使用内存模式演示；一旦配置，退款、Offer 核销和人工工单不会在连接故障时降级为内存成功，而会返回可安全重试的 `503`。`/health` 会报告连接状态。
 
 ### 多租户与配置来源
 
@@ -487,6 +494,8 @@ psql "$DATABASE_URL" -f db/migrations/001_multitenant_config.sql  # 五张 rs_ �
 psql "$DATABASE_URL" -f db/migrations/002_demo_fixtures.sql      # 演示订单与客户
 psql "$DATABASE_URL" -f db/migrations/003_helpmate_demo_bridge.sql
 psql "$DATABASE_URL" -f db/migrations/004_persistent_admin_history.sql
+psql "$DATABASE_URL" -f db/migrations/005_execution_consistency.sql  # 租户级幂等与工单去重
+psql "$DATABASE_URL" -f db/migrations/006_english_seed_policy.sql    # Admin 默认规则英文
 ```
 
 零配置仍然成立：没有库或 `RS_STORE_BACKEND=memory` 时走内置默认配置，hermetic 测试与离线演示不受影响。`/health` 的 `config.source` 会如实报 `builtin` 还是 `database`。

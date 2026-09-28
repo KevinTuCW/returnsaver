@@ -10,7 +10,7 @@ RetentionDeps 就是「这段会话钉住的那一版配置」，所以快照语
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import config as C
@@ -30,6 +30,7 @@ class RetentionDeps:
     get_customer: Optional[Callable[[str], Optional[dict]]] = None
     # 配置是否来自降级路径（库不可用 / 租户无配置行）
     degraded: bool = False
+    policy_extras: dict = field(default_factory=dict)
 
 
 def build_default() -> RetentionDeps:
@@ -44,6 +45,7 @@ def build_default() -> RetentionDeps:
         get_orders_of=lambda cid: store.orders_of(cid),
         get_customer=lambda cid: store.CUSTOMERS.get(cid),
         degraded=False,
+        policy_extras={},
     )
 
 
@@ -81,6 +83,9 @@ def build(principal, session) -> RetentionDeps:
         get_order = lambda oid: store.ORDERS.get(oid)                             # noqa: E731
         get_orders_of = lambda cid: store.orders_of(cid)                          # noqa: E731
         get_customer = lambda cid: store.CUSTOMERS.get(cid)                       # noqa: E731
+    extras = (db.fetch_policy_extras(principal.tenant_id, cfg.version)
+              if db.enabled() and cfg.version else
+              store.POLICY_EXTRAS.get(principal.tenant_id, {}))
     return RetentionDeps(
         config=cfg,
         config_version=cfg.version,
@@ -92,4 +97,5 @@ def build(principal, session) -> RetentionDeps:
         get_orders_of=get_orders_of,
         get_customer=get_customer,
         degraded=degraded,
+        policy_extras=extras,
     )

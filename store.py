@@ -205,8 +205,9 @@ class Session:
 
 
 SESSIONS: dict[str, Session] = {}
-EXECUTED: dict[str, dict] = {}        # 幂等表
+EXECUTED: dict[object, dict] = {}     # tenant-scoped idempotency and token JTIs
 MANUAL_QUEUE: list[dict] = []         # 人工介入工单
+POLICY_EXTRAS: dict[str, dict] = {}   # UI extensions, isolated per tenant
 
 
 def new_session(customer_id: str | None, tenant_id: str = "public",

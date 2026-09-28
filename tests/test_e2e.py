@@ -63,13 +63,26 @@ def test_order_mismatch_rejected():
 
 # ════════════════════════════════ 五个场景
 def test_scenario_not_eligible_cites_rules():
-    """场景①：不满足规则 → 附规则原文婉拒 + 给替代方案。"""
+    """场景①：不满足规则 → 附规则原文并转人工复核。"""
     _, r = full("C-003", "ORD-1003", "I want to return this jacket")
     assert r["scenario"] == "not_eligible"
-    assert r["status"] == "declined"
+    assert r["status"] == "escalated"
     assert r["cited_rules"], "婉拒必须附规则原文"
     assert any(c["code"] == "R-WINDOW" for c in r["cited_rules"])
-    assert r["offer"] is not None, "婉拒也要给台阶"
+    assert r["offer"] is None
+    assert "not_eligible" in r["ticket"]["anomalies"]
+
+
+def test_ineligible_review_is_idempotent_but_conversation_can_continue():
+    _, first = full("C-003", "ORD-1003", "I want to return this jacket")
+    _, again = neg(session_id=first["session_id"], customer_id="C-003",
+                   message="Can you check the case again?",
+                   confirm_order_id="ORD-1003")
+    assert again["status"] == "escalated"
+    assert again["ticket"]["ticket_id"] == first["ticket"]["ticket_id"]
+    import store
+    assert len([t for t in store.MANUAL_QUEUE
+                if t["session_id"] == first["session_id"]]) == 1
 
 
 def test_scenario_usage_issue_sends_guide():
@@ -133,6 +146,32 @@ def test_scenario_emotional_small_amount_instant_refund():
     assert r["experience_hook"]["type"] == "comeback_credit"
 
 
+def test_admin_auto_refund_policy_controls_runtime_qualification():
+    import dataclasses
+
+    import deps as D
+    import policy
+    import store
+
+    configured = dataclasses.replace(
+        D.build_default(),
+        policy_extras={"auto_refund": {
+            "enabled": True, "min_order_amount_usd": 10,
+            "max_order_amount_usd": 50, "minimum_prior_attempts": 1,
+            "keep_item_below_usd": 50,
+        }})
+    order = store.ORDERS["ORD-1005"]
+    customer = store.CUSTOMERS["C-005"]
+    eligibility = {"eligible": True, "violated": []}
+    before, _ = policy.triage_refund(
+        order, customer, eligibility, configured, round_no=0)
+    after, payload = policy.triage_refund(
+        order, customer, eligibility, configured, round_no=1)
+    assert before.value == "escalate_human"
+    assert after.value == "instant_refund"
+    assert payload["keep_item"] is True
+
+
 def test_scenario_emotional_high_value_escalates_with_sla():
     """场景⑤b：情绪激烈 + 大额 → 人工介入，必须给死时效。"""
     _, r = full("C-006", "ORD-1006", "This is unacceptable, I want my money back NOW!")
@@ -190,6 +229,10 @@ def test_l4_execute_and_idempotent():
     assert a["status"] == "executed"
     assert b["status"] == "already_executed"
     assert a["executed_at"] == b["executed_at"], "重放不得二次发钱"
+    import store
+    session = store.get_session(r["session_id"])
+    assert session.outcome == "retained"
+    assert any(m.get("event") == "offer_executed" for m in session.messages)
 
 
 # ════════════════════════════════ 体验不变量（要求 4）
@@ -298,14 +341,14 @@ def test_metrics_reports_both_deflection_definitions():
 
 
 # ════════════════════════════════ 回归：Code Review 修掉的 8 个问题
-def test_ineligible_decline_never_routes_to_model():
+def test_ineligible_review_never_routes_to_model():
     """情绪中档（0.45≤e<0.70）的不合规单曾绕过模板走大模型，
     产出一条没有规则依据的婉拒，而断言只认 status 所以静默放行。"""
     _, r = full("C-003", "ORD-1003", "I'm disappointed, I want to return this jacket")
     assert r["scenario"] == "not_eligible"
-    assert r["status"] == "declined"
-    assert r["cited_rules"], "婉拒必须附规则原文，不论情绪高低"
-    assert r["model_calls"][-1]["tier"] == "none", "婉拒是确定性内容，不该花钱走模型"
+    assert r["status"] == "escalated"
+    assert r["cited_rules"], "人工复核必须带上命中的规则"
+    assert len(r["model_calls"]) == 1, "规则复核不该调用生成模型"
     assert r.get("experience_warning") is None
 
 
@@ -385,7 +428,9 @@ def test_accept_stays_idempotent_after_restart(monkeypatch):
     row = {"order_id": a["order_id"], "offer_id": a["offer_id"], "value": a["value"],
            "executed_at": dt.datetime.fromtimestamp(a["executed_at"], dt.timezone.utc)}
     S.EXECUTED.clear()
-    monkeypatch.setattr(db, "get_execution", lambda key: row if key == "k-boot" else None)
+    monkeypatch.setattr(
+        db, "get_execution",
+        lambda tenant, key: row if tenant == "public" and key == "k-boot" else None)
 
     b = client.post("/api/accept",
                     json={"offer_token": tok, "idempotency_key": "k-boot"}).json()

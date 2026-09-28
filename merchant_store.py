@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 # (tenant_id, version) → MerchantConfig。
 # 可以永久缓存：append-only 让这个键不可变，这是选 append-only 的附带红利。
 _CACHE: dict[tuple[str, int], M.MerchantConfig] = {}
+_MEMORY_CONFIGS: dict[str, list[M.MerchantConfig]] = {}
 
 
 def cache_clear() -> None:
@@ -31,9 +32,7 @@ def cache_clear() -> None:
 # ──────────────────────────────────────────── 库层间接层（测试可 monkeypatch）
 def _enabled() -> bool:
     import db
-    # Dev may use Postgres only for durable conversations while keeping the
-    # built-in merchant policy and mock Shopify catalog.
-    return C.ENV != "dev" and db.enabled()
+    return db.enabled()
 
 
 def _fetch_config(tenant_id: str, version: int | None) -> dict | None:
@@ -57,7 +56,8 @@ def _insert_config(tenant_id: str, fields: dict, *, created_by: str,
 def current_version(tenant_id: str) -> int:
     """该租户当前版本；无配置或库不可用时返回 0（= 内置默认）。"""
     if not _enabled():
-        return 0
+        versions = _MEMORY_CONFIGS.get(tenant_id, [])
+        return versions[-1].version if versions else 0
     try:
         row = _fetch_config(tenant_id, None)
     except Exception as e:
@@ -70,7 +70,13 @@ def current_version(tenant_id: str) -> int:
 def load(tenant_id: str, version: int | None) -> tuple[M.MerchantConfig, bool]:
     """返回 (配置, 是否降级)。version=0 或无库 → 内置默认。"""
     if not _enabled():
-        return M.BUILTIN_DEFAULT, False
+        versions = _MEMORY_CONFIGS.get(tenant_id, [])
+        if not versions or version == 0:
+            return M.BUILTIN_DEFAULT, False
+        if version is None:
+            return versions[-1], False
+        hit = next((cfg for cfg in versions if cfg.version == version), None)
+        return (hit or M.BUILTIN_DEFAULT), hit is None
     if version == 0:
         # 会话钉的就是「内置默认」这一版，尊重它，不要悄悄升到库里的最新版
         return M.BUILTIN_DEFAULT, False
@@ -137,6 +143,12 @@ def save(tenant_id: str, fields: dict, *, created_by: str,
     violations = M.validate(fields)
     if violations:
         raise ValueError("; ".join(f"{v.field}: {v.detail}" for v in violations))
+    if not _enabled():
+        version = current_version(tenant_id) + 1
+        cfg = M.clamp({**fields, "version": version})
+        _MEMORY_CONFIGS.setdefault(tenant_id, []).append(cfg)
+        _CACHE[(tenant_id, version)] = cfg
+        return version
     version = _insert_config(tenant_id, fields, created_by=created_by, note=note)
     return version
 
